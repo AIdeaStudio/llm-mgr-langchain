@@ -4,9 +4,6 @@
 
 该管理器设计的核心是**模式化**和**多租户支持**，使其能够适应从个人开发、私有化部署到多用户 SaaS 平台的多种应用场景。
 
-[![Python Version](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
-[![License](https://img.shields.io/badge/license-MIT-green.svg)](https://opensource.org/licenses/MIT)
-
 ## ✨ 核心特性
 
 *   **三种使用模式**：内置支持三种主流使用场景，只需修改一个配置即可切换。
