@@ -30,17 +30,25 @@ SYSTEM_USER_ID = "-1"
 LLM_AUTO_KEY = True#如果为True 则当用户无apikey时 将尝试自动获取服务器apikey密钥 ⚠️所以如果不想给用户提供apikey 请保持此项为False
 USE_SYS_LLM_CONFIG = True #如果为True 则所有用户均使用系统平台配置 不能创建自己的平台和模型
 
+#环境变量配置 按需配置 可为空
 MODELSCOPE_API_KEY = os.environ.get("MODELSCOPE_API_KEY")
 ALIYUN_API_KEY = os.environ.get("ALIYUN_API_KEY")#注意 这里为了好区分没有用默认的DASHSCOPE做名字
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
 GEMINIX_API_KEY = os.environ.get("GEMINIX_API_KEY")
+GEMINIX_URL = os.environ.get("GEMINIX_URL","")#自定义的Gemini API BASE URL地址 如 http://api.com 不要以/结尾
+
+if not MODELSCOPE_API_KEY or not ALIYUN_API_KEY or not OPENROUTER_API_KEY or not GEMINIX_API_KEY:
+    print("环境变量未全部设置，部分系统级APIKEY不会生效")
+
+if GEMINIX_URL=="":
+    print("未设置 GEMINIX_URL，将无法使用自定义的 Gemini")
 
 
 #系统内置平台模型模板 所有情况下禁止用户修改 但允许用户隐藏/显示 要修改请直接修改此处
 #此处的模型简称不要重复 get_spec_sys_llm 取系统内置的某一个具体模型 依靠显示名字获取模型
 DEFAULT_PLATFORM_CONFIGS: Dict[str, Any] = {
         "Google AIStudio": {
-        "base_url": "http://dx.nb.s1.natgo.cn:10241/v1",
+        "base_url": f"{GEMINIX_URL}/v1",
         "api_key": GEMINIX_API_KEY,
         "models": {
             "哈基米flash": "gemini-2.5-flash",
@@ -196,9 +204,26 @@ class AIManager:
         同步 DEFAULT_PLATFORM_CONFIGS 到数据库，作为系统平台模板 (is_sys=1)。
         这些模板的 api_key 字段将始终为 None。
         使用 base_url 作为系统平台的唯一标识，确保即使名称被修改也能正确同步。
+        会删除配置中已移除的系统平台和模型。
         """
         with self.Session() as session:
             print("同步系统平台模板...")
+            
+            # 收集配置中所有的 base_url
+            config_base_urls = {cfg["base_url"] for cfg in DEFAULT_PLATFORM_CONFIGS.values()}
+            
+            # 获取数据库中所有的系统平台
+            all_sys_platforms = session.query(LLMPlatform).filter_by(is_sys=1).all()
+            
+            # 删除配置中已移除的系统平台
+            for plat in all_sys_platforms:
+                if plat.base_url not in config_base_urls:
+                    print(f"删除已移除的系统平台: {plat.name} ({plat.base_url})")
+                    session.delete(plat)
+            
+            session.flush()
+            
+            # 同步配置中的平台和模型
             for name, cfg in DEFAULT_PLATFORM_CONFIGS.items():
                 base_url = cfg["base_url"]
                 # 优先使用 base_url 来匹配系统平台，防止名称被修改导致的问题
@@ -213,8 +238,11 @@ class AIManager:
                     )
                     session.add(plat)
                     session.flush()
+                    print(f"添加新系统平台: {name}")
                 else:
                     # 强制恢复系统平台的标准名称，修复被重命名的情况
+                    if plat.name != name:
+                        print(f"恢复系统平台名称: {plat.name} -> {name}")
                     plat.name = name
                     plat.base_url = base_url
                     plat.api_key = None # 确保始终为None
@@ -223,9 +251,14 @@ class AIManager:
                 existing_models = {m.display_name: m for m in plat.models}
                 for display_name, model_name in cfg.get("models", {}).items():
                     if display_name in existing_models:
-                        existing_models[display_name].model_name = model_name
+                        # 更新已存在的模型
+                        if existing_models[display_name].model_name != model_name:
+                            print(f"更新模型 {display_name}: {existing_models[display_name].model_name} -> {model_name}")
+                            existing_models[display_name].model_name = model_name
                         del existing_models[display_name]
                     else:
+                        # 添加新模型
+                        print(f"添加新模型: {display_name} ({model_name}) 到平台 {name}")
                         new_model = LLModels(
                             platform_id=plat.id,
                             model_name=model_name,
@@ -233,7 +266,9 @@ class AIManager:
                         )
                         session.add(new_model)
                 
+                # 删除配置中已移除的模型
                 for model_to_delete in existing_models.values():
+                    print(f"删除已移除的模型: {model_to_delete.display_name} ({model_to_delete.model_name}) 从平台 {name}")
                     session.delete(model_to_delete)
 
             session.commit()
@@ -891,6 +926,7 @@ class AIManager:
             return {
                 "platform": platform_obj.name,
                 "platform_id": platform_obj.id,
+                "platform_is_sys": bool(platform_obj.is_sys),
                 "base_url": base_url,
                 "model_display_name": model_obj.display_name,
                 "model_id": model_obj.id,
