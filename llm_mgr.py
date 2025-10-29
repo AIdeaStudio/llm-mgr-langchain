@@ -4,6 +4,7 @@
 # 3.多用户自定义平台模式 用户可以自由拓展自己的平台
 # 支持用户隐藏/显示平台以符合不同用户的需求
 import os
+import json
 from typing import Dict, Any, Optional, List
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_openai import ChatOpenAI
@@ -47,41 +48,29 @@ if not MODELSCOPE_API_KEY or not ALIYUN_API_KEY or not OPENROUTER_API_KEY or not
 if GEMINIX_URL=="":
     print("未设置 GEMINIX_URL，将无法使用自定义的 Gemini")
 
-
 #系统内置平台模型模板 所有情况下禁止用户修改 但允许用户隐藏/显示 要修改请直接修改此处
 #此处的模型简称不要重复 get_spec_sys_llm 取系统内置的某一个具体模型 依靠显示名字获取模型
 DEFAULT_PLATFORM_CONFIGS: Dict[str, Any] = {
         "Google AIStudio": {
         "base_url": f"{GEMINIX_URL}/v1",
-        "api_key": GEMINIX_API_KEY,
         "models": {
+            "哈基米lite": "gemini-2.5-flash-lite",
             "哈基米flash": "gemini-2.5-flash",
             "哈基米pro": "gemini-2.5-pro",
         },
     },
-    "魔搭ModelScope": {
-        "base_url": "https://api-inference.modelscope.cn/v1/",
-        "api_key": MODELSCOPE_API_KEY,
-        "models": {
-            "通义千问3 V2507": "Qwen/Qwen3-235B-A22B-Instruct-2507",
-            "DeepSeek V3.1": "deepseek-ai/DeepSeek-V3.1",
-            "智谱 GLM 4.6": "ZhipuAI/GLM-4.6",
-        },
-    },
-    "OpenRouter": {
-        "base_url": "https://openrouter.ai/api/v1",
-        "api_key": OPENROUTER_API_KEY,
-        "models": {
-            "DeepSeek V3-0324": "deepseek/deepseek-chat-v3-0324:free",
-            "DeepSeek R1-0528": "deepseek/deepseek-r1-0528:free",
-        },
-    },
-    "阿里云百炼": {
-        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-        "api_key": ALIYUN_API_KEY,
-        "models": {"通义千问Plus": "qwen-plus-latest", "通义千问极速版": "qwen-flash"},
-    },
 }
+
+# 从外部 JSON 文件加载并合并平台配置
+try:
+    config_path = os.path.join(os.path.dirname(__file__), "llm_mgr_config.json")
+    if os.path.exists(config_path):
+        with open(config_path, "r", encoding="utf-8") as f:
+            external_configs = json.load(f)
+            DEFAULT_PLATFORM_CONFIGS.update(external_configs)
+            print(f"成功从 {config_path} 加载并合并了 {len(external_configs)} 个外部平台配置。")
+except Exception as e:
+    print(f"警告：加载外部平台配置文件 llm_mgr_config.json 失败: {e}")
 
 
 Base = declarative_base()
@@ -331,20 +320,25 @@ class AIManager:
     def _get_env_api_key(self, platform_name: str = None, base_url: str = None) -> Optional[str]:
         """
         从环境变量配置中获取平台的 API Key
-        优先使用 base_url 匹配（更可靠），其次使用 platform_name
         """
-        # 优先使用 base_url 查找（容错性更好）
+        # 平台名称到环境变量的映射
+        PLATFORM_TO_ENV_KEY = {
+            "Google AIStudio": GEMINIX_API_KEY,
+            "魔搭ModelScope": MODELSCOPE_API_KEY,
+            "OpenRouter": OPENROUTER_API_KEY,
+            "阿里云百炼": ALIYUN_API_KEY,
+        }
+
+        # 优先通过平台名称直接查找
+        if platform_name and platform_name in PLATFORM_TO_ENV_KEY:
+            return PLATFORM_TO_ENV_KEY[platform_name]
+
+        # 如果平台名称找不到，尝试通过 base_url 反向查找平台名称
         if base_url:
-            for cfg in DEFAULT_PLATFORM_CONFIGS.values():
+            for name, cfg in DEFAULT_PLATFORM_CONFIGS.items():
                 if cfg.get("base_url") == base_url:
-                    return cfg.get("api_key")
-        
-        # 其次使用 platform_name 查找
-        if platform_name:
-            cfg = DEFAULT_PLATFORM_CONFIGS.get(platform_name)
-            if cfg:
-                return cfg.get("api_key")
-        
+                    return PLATFORM_TO_ENV_KEY.get(name)
+
         return None
     
     def _get_effective_api_key(self, session, user_id: str, platform: LLMPlatform) -> Optional[str]:
@@ -971,7 +965,7 @@ class AIManager:
             try:
                 platform_config = DEFAULT_PLATFORM_CONFIGS[platform_name]
                 model_name = platform_config["models"][model_display_name]
-                api_key = platform_config.get("api_key")
+                api_key = self._get_env_api_key(platform_name=platform_name)
                 base_url = platform_config.get("base_url")
 
                 if not api_key:
