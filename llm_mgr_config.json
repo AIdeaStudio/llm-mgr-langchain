@@ -1,0 +1,24 @@
+{
+    "魔搭ModelScope": {
+        "base_url": "https://api-inference.modelscope.cn/v1/",
+        "models": {
+            "通义千问3 V2507": "Qwen/Qwen3-235B-A22B-Instruct-2507",
+            "DeepSeek V3.1": "deepseek-ai/DeepSeek-V3.1",
+            "智谱 GLM 4.6": "ZhipuAI/GLM-4.6"
+        }
+    },
+    "OpenRouter": {
+        "base_url": "https://openrouter.ai/api/v1",
+        "models": {
+            "DeepSeek V3-0324": "deepseek/deepseek-chat-v3-0324:free",
+            "DeepSeek R1-0528": "deepseek/deepseek-r1-0528:free"
+        }
+    },
+    "阿里云百炼": {
+        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "models": {
+            "通义千问Plus": "qwen-plus-latest",
+            "通义千问极速版": "qwen-flash"
+        }
+    }
+}
