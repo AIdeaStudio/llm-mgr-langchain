@@ -4,7 +4,8 @@
 # 3.多用户自定义平台模式 用户可以自由拓展自己的平台
 # 支持用户隐藏/显示平台以符合不同用户的需求
 import os
-import json
+import yaml
+import re
 from typing import Dict, Any, Optional, List
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_openai import ChatOpenAI
@@ -25,52 +26,59 @@ from sqlalchemy.orm import (
 
 # 当 user_id = '-1' 时，代表系统运行于无用户/全局单用户模式，也称$系统模式$
 # 这是一个虚拟的系统用户，从环境变量获取apikey，不需要用户自己设置apikey
-#⚠️当用户无apikey时 将尝试自动获取服务器apikey密钥 
+#⚠️当用户无apikey时 将尝试自动获取服务器apikey密钥
 SYSTEM_USER_ID = "-1"
 
 LLM_AUTO_KEY = True#如果为True 则当用户无apikey时 将尝试自动获取服务器apikey密钥 ⚠️所以如果不想给用户提供apikey 请保持此项为False
 USE_SYS_LLM_CONFIG = True #如果为True 则所有用户均使用系统平台配置 不能创建自己的平台和模型
 
-
-#环境变量配置 按需配置 可为空
-MODELSCOPE_API_KEY = os.environ.get("MODELSCOPE_API_KEY")
-ALIYUN_API_KEY = os.environ.get("ALIYUN_API_KEY")#注意 这里为了好区分没有用默认的DASHSCOPE做名字
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
-GEMINIX_API_KEY = os.environ.get("GEMINIX_API_KEY")
-
 #指定平台的配置
-GEMINIX_URL = os.environ.get("GEMINIX_URL","")#自定义的Gemini API BASE URL地址 如 http://api.com 不要以/结尾
 GEMINI_FAST = True # 如果为True 则为gemini-flash系列跳过思考 用于快速处理任务（思考预算=0）
 
-if not MODELSCOPE_API_KEY or not ALIYUN_API_KEY or not OPENROUTER_API_KEY or not GEMINIX_API_KEY:
-    print("环境变量未全部设置，部分系统级APIKEY不会生效")
 
-if GEMINIX_URL=="":
-    print("未设置 GEMINIX_URL，将无法使用自定义的 Gemini")
+def substitute_env_vars(text: str) -> str:
+    """替换字符串中的 {ENV_VAR} 占位符为环境变量值"""
+    if not isinstance(text, str):
+        return text
+    
+    pattern = r'\{([^}]+)\}'
+    
+    def replace_match(match):
+        var_name = match.group(1).strip()
+        return os.environ.get(var_name, f"{{{var_name}}}")  # 环境变量不存在时保持原样
+    
+    return re.sub(pattern, replace_match, text)
 
-#系统内置平台模型模板 所有情况下禁止用户修改 但允许用户隐藏/显示 要修改请直接修改此处
-#此处的模型简称不要重复 get_spec_sys_llm 取系统内置的某一个具体模型 依靠显示名字获取模型
-DEFAULT_PLATFORM_CONFIGS: Dict[str, Any] = {
-        "Google AIStudio": {
-        "base_url": f"{GEMINIX_URL}/v1",
-        "models": {
-            "哈基米lite": "gemini-2.5-flash-lite",
-            "哈基米flash": "gemini-2.5-flash",
-            "哈基米pro": "gemini-2.5-pro",
-        },
-    },
-}
 
-# 从外部 JSON 文件加载并合并平台配置
-try:
-    config_path = os.path.join(os.path.dirname(__file__), "llm_mgr_config.json")
-    if os.path.exists(config_path):
-        with open(config_path, "r", encoding="utf-8") as f:
-            external_configs = json.load(f)
-            DEFAULT_PLATFORM_CONFIGS.update(external_configs)
-            print(f"成功从 {config_path} 加载并合并了 {len(external_configs)} 个外部平台配置。")
-except Exception as e:
-    print(f"警告：加载外部平台配置文件 llm_mgr_config.json 失败: {e}")
+def load_default_platform_configs() -> Dict[str, Any]:
+    """从 YAML 文件加载并解析平台配置，自动处理所有环境变量"""
+    config_path = os.path.join(os.path.dirname(__file__), "llm_mgr_cfg.yaml")
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"LLM_MGR:预设平台配置文件 '{config_path}' 不存在，请手动创建 llm_mgr_cfg.yaml")
+        
+    with open(config_path, "r", encoding="utf-8") as f:
+        configs = yaml.safe_load(f)
+
+    # 统一处理所有配置项中的环境变量
+    for name, cfg in configs.items():
+        # 处理 base_url 中的环境变量占位符
+        if isinstance(cfg.get("base_url"), str):
+            cfg["base_url"] = substitute_env_vars(cfg["base_url"])
+        
+        # 处理 api_key（保持现有逻辑）
+        api_key_placeholder = cfg.get("api_key")
+        if isinstance(api_key_placeholder, str):
+            api_key_value = os.environ.get(api_key_placeholder)
+            if not api_key_value:
+                print(f"警告: 平台 '{name}' 的环境变量 '{api_key_placeholder}' 未设置。")
+            cfg["api_key"] = api_key_value
+        else:
+            cfg["api_key"] = None # 确保 api_key 字段存在
+
+    return configs
+
+
+DEFAULT_PLATFORM_CONFIGS = load_default_platform_configs()
 
 
 Base = declarative_base()
@@ -200,14 +208,10 @@ class AIManager:
         会删除配置中已移除的系统平台和模型。
         """
         with self.Session() as session:
-            print("同步系统平台模板...")
-            
             # 收集配置中所有的 base_url
-            config_base_urls = {cfg["base_url"] for cfg in DEFAULT_PLATFORM_CONFIGS.values()}
-            
+            config_base_urls = {cfg["base_url"] for cfg in DEFAULT_PLATFORM_CONFIGS.values()}  
             # 获取数据库中所有的系统平台
-            all_sys_platforms = session.query(LLMPlatform).filter_by(is_sys=1).all()
-            
+            all_sys_platforms = session.query(LLMPlatform).filter_by(is_sys=1).all()   
             # 删除配置中已移除的系统平台
             for plat in all_sys_platforms:
                 if plat.base_url not in config_base_urls:
@@ -320,25 +324,20 @@ class AIManager:
     def _get_env_api_key(self, platform_name: str = None, base_url: str = None) -> Optional[str]:
         """
         从环境变量配置中获取平台的 API Key
+        优先使用 base_url 匹配（更可靠），其次使用 platform_name
         """
-        # 平台名称到环境变量的映射
-        PLATFORM_TO_ENV_KEY = {
-            "Google AIStudio": GEMINIX_API_KEY,
-            "魔搭ModelScope": MODELSCOPE_API_KEY,
-            "OpenRouter": OPENROUTER_API_KEY,
-            "阿里云百炼": ALIYUN_API_KEY,
-        }
-
-        # 优先通过平台名称直接查找
-        if platform_name and platform_name in PLATFORM_TO_ENV_KEY:
-            return PLATFORM_TO_ENV_KEY[platform_name]
-
-        # 如果平台名称找不到，尝试通过 base_url 反向查找平台名称
+        # 优先使用 base_url 查找（容错性更好）
         if base_url:
-            for name, cfg in DEFAULT_PLATFORM_CONFIGS.items():
+            for cfg in DEFAULT_PLATFORM_CONFIGS.values():
                 if cfg.get("base_url") == base_url:
-                    return PLATFORM_TO_ENV_KEY.get(name)
-
+                    return cfg.get("api_key")
+        
+        # 其次使用 platform_name 查找
+        if platform_name:
+            cfg = DEFAULT_PLATFORM_CONFIGS.get(platform_name)
+            if cfg:
+                return cfg.get("api_key")
+        
         return None
     
     def _get_effective_api_key(self, session, user_id: str, platform: LLMPlatform) -> Optional[str]:
@@ -965,7 +964,7 @@ class AIManager:
             try:
                 platform_config = DEFAULT_PLATFORM_CONFIGS[platform_name]
                 model_name = platform_config["models"][model_display_name]
-                api_key = self._get_env_api_key(platform_name=platform_name)
+                api_key = platform_config.get("api_key")
                 base_url = platform_config.get("base_url")
 
                 if not api_key:
