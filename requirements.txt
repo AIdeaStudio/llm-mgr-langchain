@@ -1,16 +1,7 @@
-# Database ORM
-SQLAlchemy>=2.0.0
-
-# LLM Framework & Integration
-langchain-core>=0.1.0
-langchain-openai>=0.1.0
-
-# Token Counting
-tiktoken>=0.7.0
-
-# Security & Configuration
-cryptography>=42.0.0
-PyYAML>=6.0.1
-
-# Utilities
-requests>=2.32.0
+SQLAlchemy
+langchain-core
+langchain-openai
+tiktoken
+cryptography
+PyYAML
+requests
