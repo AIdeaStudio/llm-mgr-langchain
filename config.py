@@ -8,6 +8,7 @@ import re
 import yaml
 from typing import Dict, Any
 
+from .env_utils import load_env, get_env_var
 from .security import SecurityManager
 
 
@@ -20,7 +21,7 @@ SYSTEM_USER_ID = "-1"
 # 如果为True 则当用户无apikey时 将尝试自动获取服务器apikey密钥
 LLM_AUTO_KEY = True 
 # 如果为True 则所有用户均使用系统平台配置 不能创建自己的平台和模型
-USE_SYS_LLM_CONFIG = True 
+USE_SYS_LLM_CONFIG = False
 
 DEFAULT_USAGE_KEY = "main"
 BUILTIN_USAGE_SLOTS = [
@@ -60,7 +61,7 @@ def load_default_platform_configs() -> Dict[str, Any]:
         m = placeholder_re.match(api_val)
         if m:
             env_name = m.group(1)
-            env_val = os.environ.get(env_name)
+            env_val = get_env_var(env_name)
             if env_val:
                 if env_val.startswith("ENC:"):
                     cfg["api_key"] = sec_mgr.decrypt(env_val)
@@ -76,17 +77,28 @@ def load_default_platform_configs() -> Dict[str, Any]:
     return configs
 
 
+def reload_default_platform_configs() -> Dict[str, Any]:
+    """重新加载平台配置，并原地更新默认配置字典"""
+    global DEFAULT_PLATFORM_CONFIGS
+    new_configs = load_default_platform_configs()
+    if isinstance(DEFAULT_PLATFORM_CONFIGS, dict):
+        DEFAULT_PLATFORM_CONFIGS.clear()
+        DEFAULT_PLATFORM_CONFIGS.update(new_configs)
+    else:
+        DEFAULT_PLATFORM_CONFIGS = new_configs
+    return DEFAULT_PLATFORM_CONFIGS
+
+
 def _ensure_env_setup():
     """在加载配置前检查环境"""
+    # 首先加载 .env 文件
+    load_env()
+    
     # GUI/配置工具启动时允许缺少 LLM_KEY：否则会出现"用于配置密钥的工具本身无法启动"的循环依赖
     # 由 llm_mgr_cfg_gui.py 在 import 前设置该临时环境变量
-    allow_no_key = str(os.environ.get("LLM_MGR_ALLOW_NO_KEY", "")).strip().lower() in ("1", "true", "yes")
+    allow_no_key = str(get_env_var("LLM_MGR_ALLOW_NO_KEY", "")).strip().lower() in ("1", "true", "yes")
 
-    key = os.environ.get("LLM_KEY")
-    if not key and os.name == 'nt':
-        key = SecurityManager.get_win_registry_key()
-        if key:
-            os.environ["LLM_KEY"] = key
+    key = get_env_var("LLM_KEY")
             
     if not key:
         if allow_no_key:
@@ -95,13 +107,16 @@ def _ensure_env_setup():
             return
         gui_path = os.path.join(os.path.dirname(__file__), "llm_mgr_cfg_gui.py")
         if os.path.exists(gui_path):
-            print("\n" + "="*60)
-            print("⚠️ 错误：未检测到环境变量 LLM_KEY。")
-            print("这是用于加解密 系统以及用户自定义API密钥 的主密码，必须进行设置。")
-            print("\n请运行以下命令来启动配置工具进行设置：")
-            print(f"   python \"{os.path.normpath(gui_path)}\"")
-            print("="*60 + "\n")
-            raise ValueError("缺少用于加解密系统及用户密钥的 环境变量 LLM_KEY ，请运行llm_mgr_cfg_gui.py进行设置。")
+            print("\n" + "!"*80)
+            print("【重要提示】检测到系统未配置 LLM_KEY (API 密钥主密码)")
+            print("所有 API Key 均需主密码加解密，否则将无法使用。")
+            print("-" * 80)
+            print(f"方法一 (推荐): 运行配置工具\n   python \"{os.path.normpath(gui_path)}\"")
+            print("-" * 80)
+            print("方法二: 手动编辑 server/.env 文件，设置 LLM_KEY=你的密码")
+            print("方法三: 在前端页面初始化向导中设置（如果有前端的话）")
+            print("!"*80 + "\n")
+            return
 
 
 def get_decrypted_api_key(platform_name: str = None, base_url: str = None):

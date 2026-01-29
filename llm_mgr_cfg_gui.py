@@ -1,6 +1,23 @@
 """
 LLM 配置管理器 - 图形化界面
-用于管理系统平台配置（llm_mgr_cfg.yaml）
+
+⚠️ 重要说明：系统平台的两种数据源
+
+1. 数据库模式 (推荐)
+   - 直接操作 SQLite 数据库 (llm_config.db)
+   - 修改即时生效，无需重启服务
+   - 适用于：生产环境、需要动态修改配置、有前端 Web 管理界面
+
+2. YAML 模式 (传统)
+   - 直接操作 YAML 文件 (llm_mgr_cfg.yaml)
+   - 修改后需重启服务才生效
+   - 适用于：无前端环境、快速部署、配置模板分发、版本控制
+
+同步策略：
+- 首次启动时，YAML 配置初始化到数据库
+- 后续启动时，仅添加 YAML 中新增的平台，不覆盖已有配置
+- 可通过"从 YAML 重置"按钮强制同步
+
 支持平台和模型的添加、编辑、删除操作
 """
 import os
@@ -19,9 +36,13 @@ os.environ.setdefault("LLM_MGR_ALLOW_NO_KEY", "1")
 try:
     # 尝试作为包的一部分导入
     from .manager import AIManager
-    from .utils import probe_platform_models
+    from .utils import (
+        probe_platform_models, stream_speed_test, test_platform_embedding,
+        normalize_base_url, test_platform_chat
+    )
     from .security import SecurityManager
     from .config import load_default_platform_configs, DEFAULT_PLATFORM_CONFIGS
+    from .env_utils import get_env_var, set_env_var
     
     # 构造一个兼容的对象以支持旧代码中的 llm_mgr.xxx 调用
     class LLMMgrMock:
@@ -29,6 +50,10 @@ try:
     llm_mgr = LLMMgrMock()
     llm_mgr.AIManager = AIManager
     llm_mgr.probe_platform_models = probe_platform_models
+    llm_mgr.stream_speed_test = stream_speed_test
+    llm_mgr.test_platform_embedding = test_platform_embedding
+    llm_mgr.test_platform_chat = test_platform_chat
+    llm_mgr.normalize_base_url = normalize_base_url
     llm_mgr.SecurityManager = SecurityManager
     llm_mgr.load_default_platform_configs = load_default_platform_configs
     llm_mgr.DEFAULT_PLATFORM_CONFIGS = DEFAULT_PLATFORM_CONFIGS
@@ -45,15 +70,23 @@ except (ImportError, ValueError):
     try:
         # 通过全路径导入，这样内部的相对导入就能工作了
         from llm.llm_mgr.manager import AIManager
-        from llm.llm_mgr.utils import probe_platform_models
+        from llm.llm_mgr.utils import (
+            probe_platform_models, stream_speed_test, test_platform_embedding,
+            normalize_base_url, test_platform_chat
+        )
         from llm.llm_mgr.security import SecurityManager
         from llm.llm_mgr.config import load_default_platform_configs, DEFAULT_PLATFORM_CONFIGS
+        from llm.llm_mgr.env_utils import get_env_var, set_env_var
         
         class LLMMgrMock:
             pass
         llm_mgr = LLMMgrMock()
         llm_mgr.AIManager = AIManager
         llm_mgr.probe_platform_models = probe_platform_models
+        llm_mgr.stream_speed_test = stream_speed_test
+        llm_mgr.test_platform_embedding = test_platform_embedding
+        llm_mgr.test_platform_chat = test_platform_chat
+        llm_mgr.normalize_base_url = normalize_base_url
         llm_mgr.SecurityManager = SecurityManager
         llm_mgr.load_default_platform_configs = load_default_platform_configs
         llm_mgr.DEFAULT_PLATFORM_CONFIGS = DEFAULT_PLATFORM_CONFIGS
@@ -62,6 +95,10 @@ except (ImportError, ValueError):
         # 兜底处理
         AIManager = None
         probe_platform_models = None
+        stream_speed_test = None
+        test_platform_embedding = None
+        test_platform_chat = None
+        normalize_base_url = None
         SecurityManager = None
         llm_mgr = None
 
@@ -70,7 +107,7 @@ class LLMConfigGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("LLM 配置管理器")
-        self.root.geometry("1200x800")
+        self.root.geometry("1200x850")
         
         # 检查并强制设置 LLM_KEY
         self._check_and_set_llm_key()
@@ -79,15 +116,61 @@ class LLMConfigGUI:
         # 确保数据库路径正确（相对于 server 根目录）
         self.ai_manager = AIManager()
         
+        # 数据源模式：'database' 或 'yaml'
+        # 默认使用数据库模式（推荐）
+        self.data_mode = 'database'
+        
         # 创建主框架
         main_frame = ttk.Frame(root, padding="10")
         main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
         root.columnconfigure(0, weight=1)
         root.rowconfigure(0, weight=1)
         
+        # 顶部：模式选择
+        mode_frame = ttk.LabelFrame(main_frame, text="⚠️ 数据源选择（请仔细阅读说明）", padding="5")
+        mode_frame.grid(row=0, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
+        
+        self.mode_var = tk.StringVar(value='database')
+        
+        # 数据库模式
+        db_radio = ttk.Radiobutton(
+            mode_frame,
+            text="📦 数据库模式 (推荐)",
+            variable=self.mode_var,
+            value='database',
+            command=self.on_mode_change
+        )
+        db_radio.grid(row=0, column=0, sticky=tk.W, padx=10)
+        ttk.Label(
+            mode_frame,
+            text="修改即时生效，无需重启服务。适用于生产环境和 Web 前端管理。",
+            foreground="gray"
+        ).grid(row=0, column=1, sticky=tk.W, padx=5)
+        
+        # YAML 模式
+        yaml_radio = ttk.Radiobutton(
+            mode_frame,
+            text="📄 YAML 模式",
+            variable=self.mode_var,
+            value='yaml',
+            command=self.on_mode_change
+        )
+        yaml_radio.grid(row=1, column=0, sticky=tk.W, padx=10)
+        ttk.Label(
+            mode_frame,
+            text="修改后需重启服务。适用于配置分享、版本控制、无前端环境。",
+            foreground="gray"
+        ).grid(row=1, column=1, sticky=tk.W, padx=5)
+        
+        # 同步按钮
+        sync_frame = ttk.Frame(mode_frame)
+        sync_frame.grid(row=0, column=2, rowspan=2, padx=20)
+        ttk.Button(sync_frame, text="从 YAML 重置数据库", command=self.reload_from_yaml).pack(pady=2)
+        ttk.Button(sync_frame, text="导出数据库到 YAML", command=self.export_db_to_yaml).pack(pady=2)
+        
         # 左侧：平台列表
         left_frame = ttk.LabelFrame(main_frame, text="系统平台配置", padding="5")
-        left_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), padx=5)
+        left_frame.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), padx=5)
         
         # 平台选择和管理
         platform_header_frame = ttk.Frame(left_frame)
@@ -133,7 +216,9 @@ class LLMConfigGUI:
         btns_frame = ttk.Frame(model_btn_frame)
         btns_frame.pack(side=tk.RIGHT)
         
+        ttk.Button(btns_frame, text="测速选中模型", command=self.speed_test_model).pack(side=tk.LEFT, padx=2)
         ttk.Button(btns_frame, text="测试选中模型", command=self.test_model).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btns_frame, text="测试Embedding", command=self.test_embedding).pack(side=tk.LEFT, padx=2)
         ttk.Button(btns_frame, text="编辑选中模型", command=self.edit_model).pack(side=tk.LEFT, padx=2)
         ttk.Button(btns_frame, text="删除选中模型", command=self.delete_model).pack(side=tk.LEFT, padx=2)
         
@@ -145,7 +230,7 @@ class LLMConfigGUI:
         
         # 右侧：探测模型
         right_frame = ttk.LabelFrame(main_frame, text="模型探测", padding="5")
-        right_frame.grid(row=0, column=1, sticky=(tk.W, tk.E, tk.N, tk.S), padx=5)
+        right_frame.grid(row=1, column=1, sticky=(tk.W, tk.E, tk.N, tk.S), padx=5)
         
         # 探测配置区域
         ttk.Label(right_frame, text="Base URL:").grid(row=0, column=0, sticky=tk.W, pady=5)
@@ -255,11 +340,148 @@ class LLMConfigGUI:
         except Exception as e:
             messagebox.showerror("错误", f"加载配置失败: {e}")
             self.log(f"✗ 加载配置失败: {e}")
+            
+    def on_mode_change(self):
+        """数据源模式切换"""
+        new_mode = self.mode_var.get()
+        if new_mode == self.data_mode:
+            return
+            
+        self.data_mode = new_mode
+        self.log(f"⚡ 切换到 {new_mode} 模式")
+        
+        # 重新加载对应源的数据
+        if self.data_mode == 'database':
+            self.load_config_from_db()
+        else:
+            self.load_config() # 原有逻辑是加载 YAML
+
+    def load_config_from_db(self):
+        """从数据库加载配置"""
+        try:
+            # 使用 admin 方法获取系统平台
+            platforms = self.ai_manager.admin_get_sys_platforms()
+            
+            # 转换为兼容的配置格式
+            db_config = {}
+            for p in platforms:
+                p_id = p['platform_id']
+                p_name = p['name']
+                
+                # 获取平台详细信息（包括模型）
+                # 这里我们需要重新查询以获取模型列表，因为 admin_get_sys_platforms 只返回统计
+                # 直接使用 proxy_list_models 的逻辑变体或者扩充 admin 接口
+                # 暂时我们用比较笨的方法：构造配置字典
+                
+                # 注意：这里我们只能拿到 API Key 是否设置的状态，无法拿到明文 API Key
+                # 除非我们是系统用户且有密钥
+                
+                # 为了 GUI 编辑方便，我们需要获取完整数据
+                # 我们可以直接使用 manager 的 session
+                with self.ai_manager.Session() as session:
+                    from .models import LLMPlatform, LLMSysPlatformKey
+                    plat_obj = session.query(LLMPlatform).filter_by(id=p_id).first()
+                    
+                    models = {}
+                    for m in plat_obj.models:
+                        display_name = m.display_name
+                        model_cfg = {
+                            "model_name": m.model_name,
+                            "is_embedding": m.is_embedding
+                        }
+                        if m.extra_body:
+                            try:
+                                model_cfg["extra_body"] = json_lib.loads(m.extra_body)
+                            except:
+                                pass
+                        models[display_name] = model_cfg
+                    
+                    # 获取 API Key (尝试解密)
+                    api_key_val = plat_obj.api_key
+                    if not api_key_val:
+                        # 尝试获取系统配置的默认key (如果 config.py 里有)
+                        pass
+                    
+                    db_config[p_name] = {
+                        "base_url": plat_obj.base_url,
+                        "api_key": api_key_val, # 保持加密状态或明文
+                        "models": models,
+                        "_db_id": p_id # 内部标记
+                    }
+
+            self.current_config = db_config
+            
+            # 刷新 UI
+            platform_names = list(self.current_config.keys())
+            self.platform_combo['values'] = platform_names
+            
+            if platform_names:
+                self.platform_var.set(platform_names[0])
+                self.on_platform_selected()
+            else:
+                self.platform_var.set("")
+                self.model_listbox.delete(0, tk.END)
+                
+            self.log("✓ 已从数据库加载配置", tag="success")
+            
+        except Exception as e:
+            messagebox.showerror("错误", f"从数据库加载失败: {e}")
+            self.log(f"✗ 从数据库加载失败: {e}")
+            # 回退到 YAML 模式
+            self.mode_var.set('yaml')
+            self.data_mode = 'yaml'
+            self.load_config()
+
+    def reload_from_yaml(self):
+        """强制从 YAML 重置数据库"""
+        if not messagebox.askyesno("确认重置",
+            "⚠️ 警告：这将使用 YAML 文件覆盖数据库中的所有系统平台配置！\n\n"
+            "- 数据库中新增的平台将被删除\n"
+            "- 平台名称和模型列表将重置为 YAML 中的状态\n"
+            "- 用户的 API Key 设置不会受影响\n\n"
+            "确定要继续吗？"):
+            return
+            
+        try:
+            self.ai_manager.admin_reload_from_yaml()
+            self.log("✓ 数据库已从 YAML 重置", tag="success")
+            messagebox.showinfo("成功", "数据库已重置。")
+            
+            # 如果当前在数据库模式，刷新显示
+            if self.data_mode == 'database':
+                self.load_config_from_db()
+                
+        except Exception as e:
+            messagebox.showerror("错误", f"重置失败: {e}")
+            self.log(f"✗ 重置失败: {e}")
+
+    def export_db_to_yaml(self):
+        """导出数据库配置到 YAML"""
+        if not messagebox.askyesno("确认导出",
+            "这将覆盖当前的 llm_mgr_cfg.yaml 文件。\n"
+            "确定要导出数据库配置吗？"):
+            return
+            
+        try:
+            # 切换到数据库模式以确保加载最新数据
+            if self.data_mode != 'database':
+                self.load_config_from_db()
+            
+            # 保存到文件 (复用现有逻辑，因为 current_config 已经是通过 DB 加载的结构)
+            self._save_config_to_file()
+            
+            messagebox.showinfo("成功", "已导出到 llm_mgr_cfg.yaml")
+            
+        except Exception as e:
+            messagebox.showerror("错误", f"导出失败: {e}")
     
     def reload_config(self):
         """重新加载配置"""
         try:
-            self.load_config()
+            if self.data_mode == 'database':
+                self.load_config_from_db()
+            else:
+                self.load_config()
             self.log("✓ 配置已重新加载", tag="success")
         except Exception as e:
             messagebox.showerror("错误", f"重新加载失败: {e}")
@@ -311,11 +533,7 @@ class LLMConfigGUI:
         models = platform_cfg.get("models", {})
 
         for display_name, model_config in models.items():
-            if isinstance(model_config, str):
-                model_id = model_config
-            else:
-                model_id = model_config.get("model_name", "")
-            self.model_listbox.insert(tk.END, f"{display_name} → {model_id}")
+            self.model_listbox.insert(tk.END, self._format_model_list_item(display_name, model_config))
 
         # 异步执行一次模型探测
         self.probe_models(auto_start=True)
@@ -353,27 +571,6 @@ class LLMConfigGUI:
         self.platform_var.set(new_name)
         
         self._save_config_to_file()
-
-    def _normalize_base_url(self, url: str) -> str:
-        """规范化 Base URL (与 admin.py 逻辑保持一致)"""
-        url = url.strip()
-        if not url:
-            return url
-            
-        # 移除末尾斜杠
-        url = url.rstrip('/')
-        
-        # 如果以 /chat/completions 结尾，移除它
-        if url.endswith('/chat/completions'):
-            url = url[:-17]
-            url = url.rstrip('/')
-            
-        # 自动补全 /v1
-        import re
-        if not re.search(r'/v\d+$', url):
-            url = f"{url}/v1"
-
-        return url
 
     def add_platform(self):
         """添加新平台"""
@@ -415,7 +612,7 @@ class LLMConfigGUI:
                 return
             
             # 规范化 URL
-            url = self._normalize_base_url(url)
+            url = normalize_base_url(url)
             
             # 检查名称冲突
             if name in self.current_config:
@@ -528,7 +725,7 @@ class LLMConfigGUI:
             return
         
         # 规范化 URL
-        new_url = self._normalize_base_url(new_url)
+        new_url = normalize_base_url(new_url)
         
         try:
             # 更新配置
@@ -676,6 +873,23 @@ class LLMConfigGUI:
             messagebox.showwarning("警告", "请输入要使用的模型名称")
             return
         self.open_add_model_dialog(custom_model_id=custom_model_id)
+
+    def _format_model_list_item(self, display_name: str, model_config) -> str:
+        if isinstance(model_config, str):
+            model_id = model_config
+            is_embedding = False
+        else:
+            model_id = model_config.get("model_name", "")
+            is_embedding = bool(model_config.get("is_embedding"))
+
+        tag = " [EMB]" if is_embedding else ""
+        return f"{display_name}{tag} → {model_id}"
+
+    def _extract_display_name(self, item_text: str) -> str:
+        display_part = item_text.split(" → ")[0]
+        if display_part.endswith(" [EMB]"):
+            display_part = display_part[:-6]
+        return display_part
     
     def open_add_model_dialog(self, custom_model_id=None):
         """打开添加模型对话框"""
@@ -714,11 +928,15 @@ class LLMConfigGUI:
         if selected_model_id:
             model_id_entry.insert(0, selected_model_id)
         
+        # Embedding 标记
+        is_embedding_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(dialog, text="Embedding 模型", variable=is_embedding_var).grid(row=2, column=1, sticky=tk.W, padx=10)
+
         # Extra Body
-        ttk.Label(dialog, text="Extra Body (JSON):").grid(row=2, column=0, sticky=(tk.W, tk.N), padx=10, pady=10)
+        ttk.Label(dialog, text="Extra Body (JSON):").grid(row=3, column=0, sticky=(tk.W, tk.N), padx=10, pady=10)
         
         extra_body_frame = ttk.Frame(dialog)
-        extra_body_frame.grid(row=2, column=1, padx=10, pady=10, sticky=(tk.W, tk.E, tk.N, tk.S))
+        extra_body_frame.grid(row=3, column=1, padx=10, pady=10, sticky=(tk.W, tk.E, tk.N, tk.S))
         
         extra_body_text = tk.Text(extra_body_frame, width=50, height=8)
         extra_body_text.pack(fill=tk.BOTH, expand=True)
@@ -760,12 +978,18 @@ class LLMConfigGUI:
             if "models" not in self.current_config[platform_name]:
                 self.current_config[platform_name]["models"] = {}
             
-            # 根据是否有 extra_body 选择存储格式
-            if extra_body:
-                self.current_config[platform_name]["models"][display_name] = {
+            is_embedding = bool(is_embedding_var.get())
+
+            # 根据是否有 extra_body / embedding 标记 选择存储格式
+            if extra_body or is_embedding:
+                payload = {
                     "model_name": model_id,
-                    "extra_body": extra_body
                 }
+                if extra_body:
+                    payload["extra_body"] = extra_body
+                if is_embedding:
+                    payload["is_embedding"] = True
+                self.current_config[platform_name]["models"][display_name] = payload
             else:
                 self.current_config[platform_name]["models"][display_name] = model_id
             
@@ -784,13 +1008,13 @@ class LLMConfigGUI:
         
         # 按钮
         button_frame = ttk.Frame(dialog)
-        button_frame.grid(row=3, column=0, columnspan=2, pady=20)
+        button_frame.grid(row=4, column=0, columnspan=2, pady=20)
         ttk.Button(button_frame, text="添加", command=do_add, width=15).pack(side=tk.LEFT, padx=5)
         ttk.Button(button_frame, text="取消", command=dialog.destroy, width=15).pack(side=tk.LEFT, padx=5)
         
         # 配置权重
         dialog.columnconfigure(1, weight=1)
-        dialog.rowconfigure(2, weight=1)
+        dialog.rowconfigure(3, weight=1)
         
         # 居中显示
         dialog.update_idletasks()
@@ -850,8 +1074,8 @@ class LLMConfigGUI:
         # 遍历列表框中的每一项
         for i in range(self.model_listbox.size()):
             item_text = self.model_listbox.get(i)
-            # 解析显示名称： "display_name → model_id"
-            display_name = item_text.split(" → ")[0]
+            # 解析显示名称： "display_name → model_id" (兼容 embedding 标记)
+            display_name = self._extract_display_name(item_text)
             
             if display_name in current_models:
                 new_models[display_name] = current_models[display_name]
@@ -873,7 +1097,7 @@ class LLMConfigGUI:
             return
         
         model_str = self.model_listbox.get(selection[0])
-        display_name = model_str.split(" → ")[0]
+        display_name = self._extract_display_name(model_str)
         
         models = self.current_config[platform_name].get("models", {})
         model_config = models.get(display_name)
@@ -885,9 +1109,11 @@ class LLMConfigGUI:
         if isinstance(model_config, str):
             model_id = model_config
             extra_body_dict = None
+            is_embedding = False
         else:
             model_id = model_config.get("model_name", "")
             extra_body_dict = model_config.get("extra_body")
+            is_embedding = bool(model_config.get("is_embedding"))
         
         # 创建编辑对话框
         dialog = tk.Toplevel(self.root)
@@ -910,11 +1136,15 @@ class LLMConfigGUI:
         model_id_entry.insert(0, model_id)
         model_id_entry.config(state='readonly') # 禁止编辑已有模型ID
         
+        # Embedding 标记
+        is_embedding_var = tk.BooleanVar(value=is_embedding)
+        ttk.Checkbutton(dialog, text="Embedding 模型", variable=is_embedding_var).grid(row=2, column=1, sticky=tk.W, padx=10)
+
         # Extra Body
-        ttk.Label(dialog, text="Extra Body (JSON):").grid(row=2, column=0, sticky=(tk.W, tk.N), padx=10, pady=10)
+        ttk.Label(dialog, text="Extra Body (JSON):").grid(row=3, column=0, sticky=(tk.W, tk.N), padx=10, pady=10)
         
         extra_body_frame = ttk.Frame(dialog)
-        extra_body_frame.grid(row=2, column=1, padx=10, pady=10, sticky=(tk.W, tk.E, tk.N, tk.S))
+        extra_body_frame.grid(row=3, column=1, padx=10, pady=10, sticky=(tk.W, tk.E, tk.N, tk.S))
         
         extra_body_text = tk.Text(extra_body_frame, width=50, height=8)
         extra_body_text.pack(fill=tk.BOTH, expand=True)
@@ -961,11 +1191,16 @@ class LLMConfigGUI:
                 del self.current_config[platform_name]["models"][display_name]
             
             # 更新配置
-            if extra_body:
-                self.current_config[platform_name]["models"][new_display_name] = {
+            is_embedding = bool(is_embedding_var.get())
+            if extra_body or is_embedding:
+                payload = {
                     "model_name": new_model_id,
-                    "extra_body": extra_body
                 }
+                if extra_body:
+                    payload["extra_body"] = extra_body
+                if is_embedding:
+                    payload["is_embedding"] = True
+                self.current_config[platform_name]["models"][new_display_name] = payload
             else:
                 self.current_config[platform_name]["models"][new_display_name] = new_model_id
             
@@ -984,13 +1219,13 @@ class LLMConfigGUI:
         
         # 按钮
         button_frame = ttk.Frame(dialog)
-        button_frame.grid(row=3, column=0, columnspan=2, pady=20)
+        button_frame.grid(row=4, column=0, columnspan=2, pady=20)
         ttk.Button(button_frame, text="保存", command=do_update, width=15).pack(side=tk.LEFT, padx=5)
         ttk.Button(button_frame, text="取消", command=dialog.destroy, width=15).pack(side=tk.LEFT, padx=5)
         
         # 配置权重
         dialog.columnconfigure(1, weight=1)
-        dialog.rowconfigure(2, weight=1)
+        dialog.rowconfigure(3, weight=1)
         
         # 居中显示
         dialog.update_idletasks()
@@ -1232,12 +1467,87 @@ class LLMConfigGUI:
         return parsed
 
     def _save_config_to_file(self):
-        """保存配置到文件（加密敏感信息）"""
+        """保存配置到文件或数据库（根据当前模式）"""
+        if self.data_mode == 'database':
+            self._save_to_db()
+        else:
+            self._save_to_yaml()
+
+    def _save_to_db(self):
+        """将当前内存配置持久化到数据库"""
+        try:
+            # 1. 获取数据库中现有的系统平台
+            db_platforms = self.ai_manager.admin_get_sys_platforms()
+            db_plat_map = {p['name']: p['platform_id'] for p in db_platforms}
+            
+            # 2. 遍历内存中的配置
+            for p_name, p_cfg in self.current_config.items():
+                base_url = p_cfg.get("base_url")
+                api_key = p_cfg.get("api_key")
+                models = p_cfg.get("models", {})
+
+                if p_name in db_plat_map:
+                    # 更新现有平台
+                    p_id = db_plat_map[p_name]
+                    self.ai_manager.admin_update_sys_platform(p_id, p_name, base_url)
+                    if api_key:
+                        self.ai_manager.admin_update_sys_platform_api_key(p_id, api_key)
+                else:
+                    # 添加新平台
+                    p_id = self.ai_manager.admin_add_sys_platform(p_name, base_url, api_key)
+                    # 更新内存中的 ID
+                    p_cfg["_db_id"] = p_id
+
+                # 3. 处理模型同步（删除后重建以保持顺序）
+                with self.ai_manager.Session() as session:
+                    from .models import LLMPlatform, LLModels
+                    plat_obj = session.query(LLMPlatform).filter_by(id=p_id).first()
+                    if plat_obj:
+                        # 删除旧模型
+                        session.query(LLModels).filter_by(platform_id=p_id).delete()
+                        # 添加新模型
+                        for display_name, m_cfg in models.items():
+                            if isinstance(m_cfg, str):
+                                m_id = m_cfg
+                                is_emb = False
+                                extra = None
+                            else:
+                                m_id = m_cfg.get("model_name")
+                                is_emb = bool(m_cfg.get("is_embedding"))
+                                extra = json_lib.dumps(m_cfg.get("extra_body")) if m_cfg.get("extra_body") else None
+                            
+                            new_model = LLModels(
+                                platform_id=p_id,
+                                display_name=display_name,
+                                model_name=m_id,
+                                is_embedding=is_emb,
+                                extra_body=extra
+                            )
+                            session.add(new_model)
+                        session.commit()
+
+            # 4. 删除数据库中存在但内存中已删除的平台
+            for name, p_id in db_plat_map.items():
+                if name not in self.current_config:
+                    self.ai_manager.admin_delete_sys_platform(p_id)
+
+            self.log("✓ 配置已保存到数据库", tag="success")
+        except Exception as e:
+            self.log(f"✗ 数据库保存失败: {e}")
+            messagebox.showerror("错误", f"数据库保存失败: {e}")
+
+    def _save_to_yaml(self):
+        """保存配置到 YAML 文件（加密敏感信息）"""
         config_path = os.path.join(os.path.dirname(__file__), "llm_mgr_cfg.yaml")
         
         # 深拷贝配置，避免修改内存中的明文配置
         import copy
         config_to_save = copy.deepcopy(self.current_config)
+        
+        # 移除内部标记
+        for p_cfg in config_to_save.values():
+            if "_db_id" in p_cfg:
+                del p_cfg["_db_id"]
         
         # 加密所有 API Key
         sec_mgr = SecurityManager.get_instance()
@@ -1260,7 +1570,7 @@ class LLMConfigGUI:
                     self.log(f"⚠ 平台 {platform_name} 的 Key 加密失败: {e}")
                     # 询问用户是否保存明文
                     if messagebox.askyesno(
-                        "加密失败", 
+                        "加密失败",
                         f"平台 '{platform_name}' 的 API Key 加密失败。\n\n"
                         "是否以【明文】形式保存？\n"
                         "⚠️ 警告：明文保存可能导致 API Key 泄露，造成财产损失！",
@@ -1292,7 +1602,7 @@ class LLMConfigGUI:
             return
 
         model_str = self.model_listbox.get(selection[0])
-        display_name = model_str.split(" → ")[0]
+        display_name = self._extract_display_name(model_str)
 
         models = self.current_config[platform_name].get("models", {})
         model_config = models.get(display_name)
@@ -1303,9 +1613,15 @@ class LLMConfigGUI:
         if isinstance(model_config, str):
             model_id = model_config
             extra_body = None
+            is_embedding = False
         else:
             model_id = model_config.get("model_name", "")
             extra_body = model_config.get("extra_body")
+            is_embedding = bool(model_config.get("is_embedding"))
+
+        if is_embedding:
+            messagebox.showwarning("提示", "当前为 Embedding 模型，请使用『测试Embedding』按钮")
+            return
 
         base_url = self.current_config[platform_name].get("base_url", "").strip()
         api_key = self.api_key_entry.get().strip()
@@ -1322,45 +1638,175 @@ class LLMConfigGUI:
 
         self.log(f"正在测试模型: {display_name} ({model_id})...")
 
-        payload = {
-            "model": model_id,
-            "messages": [{"role": "user", "content": "一句话介绍你自己叫什么，由谁开发，用最少的回复。快速回答，无需推理或思考。"}],
-            "max_tokens": 16
-        }
-        if isinstance(extra_body, dict):
-            # 不修改原配置，复制后再合并
-            payload.update(extra_body)
-
-        url = base_url.rstrip("/")
-        if url.endswith("/v1"):
-            url = f"{url}/chat/completions"
-        elif url.endswith("/v1/"):
-            url = f"{url}chat/completions"
-        else:
-            url = f"{url}/v1/chat/completions"
-
+        test_msg = "一句话介绍你自己叫什么，由谁开发，用最少的回复。快速回答，无需推理或思考。"
+        
         def do_test():
             try:
-                import requests
-
-                headers = {
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json"
-                }
-
-                resp = requests.post(url, headers=headers, json=payload, timeout=30)
-
-                if resp.ok:
-                    result = resp.json()
-                    self.root.after(0, lambda r=result: self.show_test_result(True, display_name, r))
-                else:
-                    error_detail = f"HTTP {resp.status_code}: {resp.text[:200]}"
-                    self.root.after(0, lambda err=error_detail: self.show_test_result(False, display_name, err))
+                # 使用统一的测试函数
+                _test_chat = test_platform_chat if test_platform_chat else llm_mgr.test_platform_chat
+                
+                result = _test_chat(
+                    base_url, api_key, model_id, 
+                    extra_body=extra_body, 
+                    return_json=True
+                )
+                self.root.after(0, lambda r=result: self.show_test_result(True, display_name, r))
 
             except Exception as exc:
                 self.root.after(0, lambda err=str(exc): self.show_test_result(False, display_name, err))
 
         threading.Thread(target=do_test, daemon=True).start()
+
+    def test_embedding(self):
+        """测试选中的 Embedding 模型是否可用"""
+        platform_name = self.platform_var.get()
+        if not platform_name:
+            messagebox.showwarning("警告", "请先选择一个平台")
+            return
+
+        selection = self.model_listbox.curselection()
+        if not selection:
+            messagebox.showwarning("警告", "请在左侧选择要测试的模型")
+            return
+
+        model_str = self.model_listbox.get(selection[0])
+        display_name = self._extract_display_name(model_str)
+
+        models = self.current_config[platform_name].get("models", {})
+        model_config = models.get(display_name)
+        if not model_config:
+            messagebox.showerror("错误", f"未找到模型 '{display_name}' 的配置")
+            return
+
+        if isinstance(model_config, str):
+            model_id = model_config
+            is_embedding = False
+        else:
+            model_id = model_config.get("model_name", "")
+            is_embedding = bool(model_config.get("is_embedding"))
+
+        if not is_embedding:
+            messagebox.showwarning("提示", "当前模型不是 Embedding")
+            return
+
+        base_url = self.current_config[platform_name].get("base_url", "").strip()
+        api_key = self.api_key_entry.get().strip()
+
+        if not base_url:
+            messagebox.showerror("错误", "当前平台缺少 Base URL，无法测试 Embedding")
+            return
+        if not api_key:
+            messagebox.showerror("错误", "请填写 API Key 以进行测试")
+            return
+        if not model_id:
+            messagebox.showerror("错误", "模型配置缺少模型 ID")
+            return
+
+        self.log(f"正在测试 Embedding: {display_name} ({model_id})...")
+
+        def do_test():
+            try:
+                # 使用统一的测试函数
+                _test_embedding = test_platform_embedding if test_platform_embedding else llm_mgr.test_platform_embedding
+                
+                result = _test_embedding(base_url, api_key, model_id)
+                self.root.after(0, lambda r=result: self.show_embedding_test_result(True, display_name, r))
+            except Exception as exc:
+                self.root.after(0, lambda err=str(exc): self.show_embedding_test_result(False, display_name, err))
+
+        threading.Thread(target=do_test, daemon=True).start()
+
+    def show_embedding_test_result(self, success, model_name, result):
+        """在主线程中显示 Embedding 测试结果"""
+        if success:
+            dims = None
+            if isinstance(result, dict):
+                dims = result.get("dims")
+            msg = f"Embedding '{model_name}' 可用！"
+            if dims:
+                msg = f"Embedding '{model_name}' 可用！\n向量维度: {dims}"
+            self.log(f"✓ Embedding '{model_name}' 测试成功", tag="success")
+            messagebox.showinfo("测试成功", msg)
+        else:
+            self.log(f"✗ Embedding '{model_name}' 测试失败: {result}")
+            messagebox.showerror("测试失败", f"Embedding '{model_name}' 测试失败。\n\n错误详情:\n{result}")
+
+    def speed_test_model(self):
+        """流式测速选中的模型"""
+        platform_name = self.platform_var.get()
+        if not platform_name:
+            messagebox.showwarning("警告", "请先选择一个平台")
+            return
+
+        selection = self.model_listbox.curselection()
+        if not selection:
+            messagebox.showwarning("警告", "请在左侧选择要测试的模型")
+            return
+
+        model_str = self.model_listbox.get(selection[0])
+        display_name = self._extract_display_name(model_str)
+
+        models = self.current_config[platform_name].get("models", {})
+        model_config = models.get(display_name)
+        if not model_config:
+            return
+
+        if isinstance(model_config, str):
+            model_id = model_config
+            extra_body = None
+            is_embedding = False
+        else:
+            model_id = model_config.get("model_name", "")
+            extra_body = model_config.get("extra_body")
+            is_embedding = bool(model_config.get("is_embedding"))
+
+        if is_embedding:
+            messagebox.showwarning("提示", "Embedding 模型不支持测速")
+            return
+
+        base_url = self.current_config[platform_name].get("base_url", "").strip()
+        api_key = self.api_key_entry.get().strip()
+
+        if not base_url or not api_key:
+            messagebox.showerror("错误", "缺少 URL 或 API Key")
+            return
+
+        self.log(f"开始测速模型: {display_name} (预计5秒)...")
+
+        def do_speed_test():
+            try:
+                # 使用全局导入的 stream_speed_test
+                if llm_mgr and hasattr(llm_mgr, 'stream_speed_test'):
+                    _stream_speed_test = llm_mgr.stream_speed_test
+                else:
+                    # 尝试动态导入作为备选
+                    try:
+                        from llm.llm_mgr.utils import stream_speed_test as _stream_speed_test
+                    except ImportError:
+                        from .utils import stream_speed_test as _stream_speed_test
+
+                # 传入 extra_body
+                generator = _stream_speed_test(base_url, api_key, model_id, extra_body=extra_body)
+                for item in generator:
+                    if "error" in item:
+                        self.root.after(0, lambda m=item["error"]: self.log(f"✗ 测速出错: {m}"))
+                        break
+                    
+                    if item["type"] == "update":
+                        msg = f"  进度: {item['elapsed']}s | 速度: {item['speed']:.1f} chars/s"
+                        self.root.after(0, lambda m=msg: self.log(m))
+                    elif item["type"] == "final":
+                        ftl_str = f"{item['ftl']:.0f}ms" if item['ftl'] else "N/A"
+                        res = (f"✓ 测速完成: {display_name}\n"
+                               f"  平均速度: {item['speed']:.1f} chars/s\n"
+                               f"  首次延迟: {ftl_str} (含推理时间)\n"
+                               f"  总输出字符: {item['total_chars']}")
+                        self.root.after(0, lambda r=res: self.log(r, tag="success"))
+                        self.root.after(0, lambda r=res: messagebox.showinfo("测速结果", r))
+            except Exception as e:
+                self.root.after(0, lambda err=str(e): self.log(f"✗ 测速失败: {err}"))
+
+        threading.Thread(target=do_speed_test, daemon=True).start()
 
     def show_test_result(self, success, model_name, result):
         """在主线程中显示测试结果"""
@@ -1443,7 +1889,7 @@ class LLMConfigGUI:
             return
         
         model_str = self.model_listbox.get(selection[0])
-        display_name = model_str.split(" → ")[0]
+        display_name = self._extract_display_name(model_str)
         
         if not messagebox.askyesno("确认", f"确定要删除模型 '{display_name}' 吗？"):
             return
@@ -1465,18 +1911,11 @@ class LLMConfigGUI:
 
     def _check_and_set_llm_key(self):
         """检查并强制设置 LLM_KEY"""
-        # 1. 检查当前进程环境变量
-        if os.environ.get("LLM_KEY"):
+        # 1. 检查环境变量（会自动从 .env 加载）
+        if get_env_var("LLM_KEY"):
             return
 
-        # 2. 尝试从注册表读取（防止当前进程未继承但注册表已有）
-        reg_key = self._get_env_from_registry("LLM_KEY")
-        if reg_key:
-            os.environ["LLM_KEY"] = reg_key
-            SecurityManager.get_instance().set_key(reg_key)
-            return
-
-        # 3. 检查配置文件中是否有加密数据
+        # 2. 检查配置文件中是否有加密数据
         has_encrypted_data = False
         encrypted_sample = None
         try:
@@ -1493,7 +1932,7 @@ class LLMConfigGUI:
         except Exception:
             pass
 
-        # 4. 强制弹窗要求设置
+        # 3. 强制弹窗要求设置
         while True:
             if has_encrypted_data:
                 prompt_msg = (
@@ -1503,9 +1942,9 @@ class LLMConfigGUI:
                 )
             else:
                 prompt_msg = (
-                    "⚠️ 未检测到 LLM_KEY 环境变量\n\n"
+                    "⚠️ 未检测到 LLM_KEY\n\n"
                     "请输入一个主密码用于加密存储 API Key：\n"
-                    "(此密码将保存到用户环境变量)"
+                    "(此密码将保存到 server/.env 文件)"
                 )
 
             key = simpledialog.askstring(
@@ -1530,8 +1969,8 @@ class LLMConfigGUI:
             # 验证密钥
             sec_mgr = SecurityManager.get_instance()
             
-            # 临时设置密钥进行测试
-            sec_mgr.set_key(key)
+            # 临时设置密钥进行测试（persist=False，先不写入文件）
+            sec_mgr.set_key(key, persist=False)
             
             if has_encrypted_data and encrypted_sample:
                 decrypted = sec_mgr.decrypt(encrypted_sample)
@@ -1550,51 +1989,18 @@ class LLMConfigGUI:
                         # 用户选择重试
                         continue
             
-            # 保存并应用
+            # 保存并应用（写入 .env 文件）
             self._persist_llm_key(key)
+            self.log("✓ 已设置主密码并应用", tag="success")
             break
-    
-    def _get_env_from_registry(self, name):
-        if os.name != 'nt': return None
-        try:
-            import winreg
-            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Environment") as key:
-                return winreg.QueryValueEx(key, name)[0]
-        except:
-            return None
 
     def _persist_llm_key(self, key_value):
-        # 1. 设置当前进程
-        os.environ["LLM_KEY"] = key_value
-        
-        # 2. 写入注册表（Windows 永久生效）
-        if os.name == 'nt':
-            try:
-                import winreg
-                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Environment", 0, winreg.KEY_SET_VALUE) as reg_key:
-                    winreg.SetValueEx(reg_key, "LLM_KEY", 0, winreg.REG_SZ, key_value)
-                
-                # 3. 广播消息（尝试刷新 cmd）
-                import ctypes
-                HWND_BROADCAST = 0xFFFF
-                WM_SETTINGCHANGE = 0x1A
-                SMTO_ABORTIFHUNG = 0x0002
-                result = ctypes.c_long()
-                ctypes.windll.user32.SendMessageTimeoutW(
-                    HWND_BROADCAST,
-                    WM_SETTINGCHANGE,
-                    0,
-                    "Environment",
-                    SMTO_ABORTIFHUNG,
-                    5000,
-                    ctypes.byref(result),
-                )
-                self.log("✓ 主密码已保存到用户环境变量", tag="success")
-            except Exception as e:
-                messagebox.showerror("保存失败", f"写入注册表失败: {e}")
+        """持久化 LLM_KEY 到 .env 文件"""
+        # 使用 env_utils 写入 .env 文件
+        if set_env_var("LLM_KEY", key_value):
+            self.log("✓ 主密码已保存到 server/.env 文件", tag="success")
         else:
-            # Linux/Mac 提示
-            self.log(f"✓ 请手动设置环境变量 LLM_KEY='{key_value}' 以持久化", tag="success")
+            messagebox.showerror("保存失败", "写入 .env 文件失败，请检查文件权限")
 
 
 def main():

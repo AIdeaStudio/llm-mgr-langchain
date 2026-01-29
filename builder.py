@@ -8,9 +8,9 @@ LLM 客户端构建 Mixin
 from typing import Optional, Dict, Any
 
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_openai import ChatOpenAI
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 
-from .models import LLMPlatform, LLModels, UserModelUsage, AgentModelBinding
+from .models import LLMPlatform, LLModels, UserModelUsage, AgentModelBinding, UserEmbeddingSelection
 from .config import SYSTEM_USER_ID, DEFAULT_USAGE_KEY
 from .tracked_model import TrackedChatModel
 
@@ -29,7 +29,9 @@ class LLMBuilderMixin:
         # 兜底：查询第一个系统平台和模型
         plat = session.query(LLMPlatform).filter_by(is_sys=1).first()
         if plat and plat.models:
-            return plat, plat.models[0]
+            for m in plat.models:
+                if not m.is_embedding:
+                    return plat, m
         
         raise RuntimeError("无法找到可用的默认平台和模型")
 
@@ -74,13 +76,27 @@ class LLMBuilderMixin:
             if auto_fix:
                 # 尝试使用平台的第一个模型
                 if plat.models:
-                    model = plat.models[0]
+                    model = next((m for m in plat.models if not m.is_embedding), None)
+                    if not model:
+                        raise ValueError(f"平台 '{plat.name}' 没有可用的 LLM 模型")
                     if usage_slot:
                         usage_slot.selected_model_id = model.id
                 else:
                     raise ValueError(f"平台 '{plat.name}' 没有可用模型")
             else:
                 raise ValueError(f"模型 '{model.display_name}' 不属于平台 '{plat.name}'")
+
+        # 防止 embedding 模型进入 LLM 解析
+        if model.is_embedding:
+            if auto_fix:
+                fallback = next((m for m in plat.models if not m.is_embedding), None)
+                if not fallback:
+                    raise ValueError(f"平台 '{plat.name}' 没有可用的 LLM 模型")
+                model = fallback
+                if usage_slot:
+                    usage_slot.selected_model_id = model.id
+            else:
+                raise ValueError("Embedding 模型不可用于 LLM")
         
         # 获取 API Key
         api_key = self._get_effective_api_key(session, user_id, plat)
@@ -112,6 +128,19 @@ class LLMBuilderMixin:
         返回的是 TrackedChatModel，自动追踪 Token 用量。
         可以直接调用 llm.get_usage_last_24h() 等方法查询用量。
 
+        ⚠️ 重要警告:
+        默认情况下 streaming=True。如果你需要使用 llm.invoke() 获取完整响应，
+        请在调用时传入 streaming=False：
+        
+            llm = manager.get_user_llm(user_id, streaming=False)
+            result = llm.invoke(messages)  # OK
+        
+        否则会遇到 "'Stream' object has no attribute 'model_dump'" 错误！
+        
+        流式调用 (streaming=True) 请使用:
+            for chunk in llm.stream(messages):
+                print(chunk.content)
+
         参数优先级：
         1. agent_name: 业务首选。从数据库查询该 Agent 的绑定配置。
         2. platform_id & model_id: 直接指定特定的平台和模型 ID。
@@ -119,8 +148,14 @@ class LLMBuilderMixin:
         4. 默认值: 如果以上均未提供，使用 'main' 用途。
         
         用法示例:
+            # 流式调用 (默认)
             llm = manager.get_user_llm(user_id, agent_name="agent_muse")
-            result = llm.invoke(messages)  # 自动记录用量
+            for chunk in llm.stream(messages):
+                print(chunk.content)
+            
+            # 非流式调用 (invoke)
+            llm = manager.get_user_llm(user_id, streaming=False)
+            result = llm.invoke(messages)
             
             # 查询用量
             usage = llm.get_usage_last_24h()
@@ -225,6 +260,58 @@ class LLMBuilderMixin:
                 agent_name=agent_name,
             )
 
+    def get_user_embedding(
+        self,
+        user_id: Optional[str] = None,
+        platform_id: Optional[int] = None,
+        model_id: Optional[int] = None,
+        **kwargs: Any,
+    ) -> OpenAIEmbeddings:
+        """获取用户 Embedding 实例。优先使用用户选择，否则回退到首个可用 embedding。"""
+        effective_user_id = user_id if user_id is not None else SYSTEM_USER_ID
+
+        with self.Session() as session:
+            selection = None
+            if platform_id is None or model_id is None:
+                selection = session.query(UserEmbeddingSelection).filter_by(user_id=effective_user_id).first()
+                if selection:
+                    platform_id = selection.platform_id
+                    model_id = selection.model_id
+
+            plat = session.query(LLMPlatform).filter_by(id=platform_id).first() if platform_id else None
+            model = session.query(LLModels).filter_by(id=model_id).first() if model_id else None
+
+            if not plat or not model or not model.is_embedding:
+                # 回退：找第一个可用的 embedding
+                plat = None
+                model = None
+                platforms = session.query(LLMPlatform).all()
+                for p in platforms:
+                    for m in p.models:
+                        if m.is_embedding:
+                            api_key = self._get_effective_api_key(session, effective_user_id, p)
+                            if api_key:
+                                plat = p
+                                model = m
+                                break
+                    if plat and model:
+                        break
+
+            if not plat or not model:
+                raise ValueError("未找到可用的 Embedding 模型或未配置 API Key")
+
+            api_key = self._get_effective_api_key(session, effective_user_id, plat)
+            if not api_key:
+                raise ValueError(f"平台 '{plat.name}' 的 API Key 未设置。")
+
+            return OpenAIEmbeddings(
+                model=model.model_name,
+                api_key=api_key,
+                base_url=plat.base_url,
+                check_embedding_ctx_length=False,
+                **kwargs,
+            )
+
     def get_spec_sys_llm(
         self,
         platform_name: str,
@@ -237,6 +324,8 @@ class LLMBuilderMixin:
         获取特定的系统预设模型。
         此方法为方便输入，依赖平台名称和模型显示名称定位模型。如果更改相关名称则会导致方法报错！
         注意：现在支持传入 user_id 以便使用用户自定义的 API Key 覆盖。
+        
+        ⚠️ 警告：默认 streaming=True。使用 invoke() 时请传入 streaming=False。
         """
         effective_user_id = user_id if user_id is not None else SYSTEM_USER_ID
         
