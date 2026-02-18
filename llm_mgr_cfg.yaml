@@ -1,62 +1,34 @@
-谷歌白嫖站:
-  base_url: http://nb.s1.natgo.cn:10240/v1
-  api_key: ENC:gAAAAABpRt6Gec_h7gpehodw_AcKvIz198Aj9hR1ko4ixL2aSRfUJn6ECiodIvmaHa7639g7s50MwxmqvpinAf1PsKJjUm5JW7c7Zm7VLmgUQPNVAERH6vU=
+魔搭ModelScope:
+  base_url: https://api-inference.modelscope.cn/v1
   models:
-    Gemini2.5Lite:
-      model_name: gemini-flash-lite-latest
+    DeepSeek-V3.2:
+      model_name: deepseek-ai/DeepSeek-V3.2
       extra_body:
-        thinkingBudget: 0
-    Gemini3Flash:
-      model_name: gemini-3-flash-preview
+        enable_thinking: false
+    moonshotai/Kimi-K2.5:
+      model_name: moonshotai/Kimi-K2.5
       extra_body:
-        thinkingBudget: 0
-    Gemini2.5flash:
-      model_name: gemini-2.5-flash
+        thinking:
+          type: disabled
+  api_key: ENC:gAAAAABpkIaAd4T36ew9hvsbnzx7FdC54NV81iBJdh_fIyykA0zRAcYvDQckpo8gTo9sF3CPiK7nfgNNXw5t2t04umPT_Z-T2qfftm8ED9YyHN9mVaU0JcSzSczywOXB0Nx5RpHdp-AP
+小米:
+  base_url: https://api.xiaomimimo.com/v1
+  models:
+    小米:
+      model_name: mimo-v2-flash
       extra_body:
-        thinkingBudget: 0
+        thinking:
+          type: disabled
+  api_key: ENC:gAAAAABpkIaABc5ja75u0aHMK1eupvpu_0hH4Rgmz73mSVNo-QrH1e3TzamPVLgrgDo2ZXh-StXjGQPhgalrqtUDMpZJpQnehIxy-MzWUSRbXlTjt1vGGtgKlmSexSatu3FCU_q-zGT60bWo2r-oPyiVtgRfn_3k-g==
 阿里云百炼:
   base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
-  api_key: ENC:gAAAAABpHXAbT91jMIYC_kSheaj5q4VKyweY43jkzAkMgMTkqucZTSeNcbd_NhboWGzOAHJ5MJVxImczVyoWyGDf7Ef3exnrxyE9IZDWTPzKFESgW3efEJKnW52IubT5_G8HfhUV4UPP
   models:
-    通义flash: qwen-flash
     通义Plus: qwen-plus-latest
     Deepseek V3.2:
       model_name: deepseek-v3.2
       extra_body:
         enable_thinking: false
-    deepseek-v3.2-thinking:
-      model_name: deepseek-v3.2
-      extra_body:
-        enable_thinking: true
-    GLM4.7:
-      model_name: glm-4.7
-      extra_body:
-        enable_thinking: false
     通义向量-v4:
       model_name: text-embedding-v4
       is_embedding: true
-魔搭ModelScope:
-  base_url: https://api-inference.modelscope.cn/v1/
-  api_key: ENC:gAAAAABpHXAbwNIMhD51yTECVOxftN_K-A-EUGQh2bbdp6dG2xUthYAdYqhPoGhmUPk9sX4CPGOXfnzTpB8702XrO2LYUq0_BPy6GI59HiLxyzT0DYnM99kCykQRvg5BOwh0HIk-aFZa
-  models:
-    通义千问3 V2507: Qwen/Qwen3-235B-A22B-Instruct-2507
-    DeepSeek V3.1:
-      model_name: deepseek-ai/DeepSeek-V3.1
-      extra_body:
-        enable_thinking: false
-    智谱 GLM 4.6:
-      model_name: ZhipuAI/GLM-4.6
-      extra_body:
-        thinking:
-          type: disabled
-    deepseek-ai/DeepSeek-V3.2:
-      model_name: deepseek-ai/DeepSeek-V3.2
-      extra_body:
-        enable_thinking: false
-小米:
-  base_url: https://api.xiaomimimo.com/v1
-  models:
-    小米: mimo-v2-flash
-  api_key: ENC:gAAAAABpR9GYP_zO9vOtP0FprxZpZ9bNxwdMdusormZ2ieBJTVHoTms2TnuOeHy5Z4z56z9DZpGWt2vCUcvxYUp3QZcD9hBiNvlYud84F5yO9u5A-uqKqu9kEUF5Kq7Bbpd_I3ol3wGIbaFRjMpf9mQ3sMQGGprhMw==
-metadata:
-  USE_SYS_LLM_CONFIG: true
+  api_key: ENC:gAAAAABpkIaAejj4Y9sO9WIvbC03TGXIMNit1jShmZ_DXgRPmj7eNfZJ8C3s2gRk33B632SBRcwpylbYNbVFV9hfxC9RZMLonJpMnMMWX3fBDb9ZEdPf9XSxW7eXm3YiOXdRUMnAd4Oi

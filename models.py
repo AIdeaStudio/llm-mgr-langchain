@@ -8,9 +8,11 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Integer,
+    Float,
     String,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.orm import (
     declarative_base,
@@ -29,7 +31,8 @@ class LLMPlatform(Base):
     base_url = Column(String(255), nullable=False)
     api_key = Column(String(512), nullable=True)
     is_sys = Column(Integer, default=0) 
-    hide = Column(Integer, default=0) 
+    disable = Column(Integer, default=0)
+    sort_order = Column(Integer, default=0)
     models = relationship("LLModels", backref="platform", cascade="all, delete-orphan")
 
 
@@ -49,7 +52,7 @@ class LLMSysPlatformKey(Base):
         index=True,
     )
     api_key = Column(String(512), nullable=True)
-    hide = Column(Integer, default=0)
+    disable = Column(Integer, default=0)
     platform = relationship("LLMPlatform", backref="sys_keys")
 
 
@@ -66,7 +69,10 @@ class LLModels(Base):
     model_name = Column(String(120), nullable=False, index=True)
     display_name = Column(String(120), nullable=True)
     extra_body = Column(String(1024), nullable=True)
+    temperature = Column(Float, nullable=True)
+    disable = Column(Integer, default=0, index=True)
     is_embedding = Column(Integer, default=0, index=True)
+    sort_order = Column(Integer, default=0)
 
 
 class UserEmbeddingSelection(Base):

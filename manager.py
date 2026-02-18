@@ -6,6 +6,7 @@ AIManager 核心实现
 import os
 import json
 import threading
+import time
 from typing import Dict, Any, Optional, List
 
 from sqlalchemy import create_engine
@@ -40,11 +41,15 @@ class AIManagerBase:
         # 注意：表创建现由 Alembic 迁移管理
         # 首次部署时运行: cd server && alembic upgrade head -x db=llm
         # 保留 create_all 以确保向后兼容（无 Alembic 环境时自动创建表）
-        Base.metadata.create_all(self.engine)
+        # [FIX] 在 Alembic 运行时调用的 import 链中会导致死锁/占用，故注释掉。
+        # Base.metadata.create_all(self.engine)
         self.Session = sessionmaker(bind=self.engine, expire_on_commit=False)
         self._sys_platforms_cache = None 
         self._cache_lock = threading.Lock()
+        self._sys_platforms_cache_at = 0.0
+        self._sys_platforms_cache_ttl = float(os.getenv("LLM_SYS_PLATFORM_CACHE_TTL", "5"))
         self.use_sys_llm_config = USE_SYS_LLM_CONFIG
+        self.llm_auto_key = LLM_AUTO_KEY
         self._default_platform_id = None
         self._default_model_id = None
         self._builtin_usage_map = {slot["key"]: slot for slot in BUILTIN_USAGE_SLOTS}
@@ -62,6 +67,8 @@ class AIManagerBase:
                     # 仅覆盖允许动态修改的配置
                     if "use_sys_llm_config" in state:
                         self.use_sys_llm_config = state["use_sys_llm_config"]
+                    if "llm_auto_key" in state:
+                        self.llm_auto_key = state["llm_auto_key"]
             except Exception as e:
                 print(f"加载状态失败: {e}")
 
@@ -69,7 +76,8 @@ class AIManagerBase:
         """保存运行时状态"""
         try:
             state = {
-                "use_sys_llm_config": self.use_sys_llm_config
+                "use_sys_llm_config": self.use_sys_llm_config,
+                "llm_auto_key": self.llm_auto_key
             }
             with open(self.state_file, 'w', encoding='utf-8') as f:
                 json.dump(state, f, indent=2)
@@ -134,19 +142,29 @@ class AIManagerBase:
         参数:
             force_reset: 是否强制从 YAML 重置（会覆盖数据库中的所有系统平台配置）
         """
+        def _encrypt_if_possible(value: Optional[str]) -> Optional[str]:
+            if not value:
+                return None
+            try:
+                return SecurityManager.get_instance().encrypt(value)
+            except Exception:
+                return None
+
         with self.Session() as session:
             config_base_urls = {cfg["base_url"] for cfg in DEFAULT_PLATFORM_CONFIGS.values() if isinstance(cfg, dict) and "base_url" in cfg}
             all_sys_platforms = session.query(LLMPlatform).filter_by(is_sys=1).all()
-            
+            # 已被管理员禁用的平台 base_url 集合（增量同步时跳过）
+            disabled_base_urls = {p.base_url for p in all_sys_platforms if p.disable}
+
             # 检查是否为首次初始化（数据库中没有任何系统平台）
             is_first_init = len(all_sys_platforms) == 0
-            
+
             if force_reset:
-                # 强制重置模式：删除所有不在 YAML 中的平台
+                # 强制重置模式：禁用所有不在 YAML 中的平台（软禁用，不硬删除）
                 for plat in all_sys_platforms:
                     if plat.base_url not in config_base_urls:
-                        print(f"[YAML重置] 删除已移除的系统平台: {plat.name} ({plat.base_url})")
-                        session.delete(plat)
+                        print(f"[YAML重置] 禁用已移除的系统平台: {plat.name} ({plat.base_url})")
+                        plat.disable = 1
                 session.flush()
             
             # 已存在的平台 base_url 集合
@@ -158,12 +176,14 @@ class AIManagerBase:
                 base_url = cfg["base_url"]
                 plat = session.query(LLMPlatform).filter_by(base_url=base_url, is_sys=1).first()
                 
-                if not plat:
-                    # 新平台：添加到数据库
+                if not plat and base_url not in disabled_base_urls:
+                    # 新平台：添加到数据库（跳过已被管理员禁用的）
+                    api_key_plain = cfg.get("api_key")
+                    encrypted_key = _encrypt_if_possible(api_key_plain)
                     plat = LLMPlatform(
                         name=name,
                         base_url=base_url,
-                        api_key=None,  # API Key 由管理员通过 GUI/API 单独设置
+                        api_key=encrypted_key,  # YAML 中若有密钥则加密写入
                         user_id=SYSTEM_USER_ID,
                         is_sys=1,
                     )
@@ -176,10 +196,12 @@ class AIManagerBase:
                         if isinstance(model_config, str):
                             model_name = model_config
                             extra_body = None
+                            temperature = None
                             is_embedding = 0
                         else:
                             model_name = model_config.get("model_name")
                             extra_body = model_config.get("extra_body")
+                            temperature = model_config.get("temperature")
                             is_embedding = 1 if model_config.get("is_embedding") else 0
                         
                         extra_body_json = json.dumps(extra_body) if extra_body else None
@@ -188,6 +210,7 @@ class AIManagerBase:
                             model_name=model_name,
                             display_name=display_name,
                             extra_body=extra_body_json,
+                            temperature=temperature,
                             is_embedding=is_embedding,
                         )
                         session.add(new_model)
@@ -197,6 +220,13 @@ class AIManagerBase:
                     if plat.name != name:
                         print(f"[YAML重置] 恢复系统平台名称: {plat.name} -> {name}")
                         plat.name = name
+
+                    # 若 YAML 提供 API Key，则更新平台默认 Key（加密写入）
+                    api_key_plain = cfg.get("api_key")
+                    if api_key_plain:
+                        encrypted_key = _encrypt_if_possible(api_key_plain)
+                        if encrypted_key:
+                            plat.api_key = encrypted_key
                     
                     # 同步模型（覆盖模式）
                     existing_models = {m.display_name: m for m in plat.models}
@@ -204,10 +234,12 @@ class AIManagerBase:
                         if isinstance(model_config, str):
                             model_name = model_config
                             extra_body = None
+                            temperature = None
                             is_embedding = 0
                         else:
                             model_name = model_config.get("model_name")
                             extra_body = model_config.get("extra_body")
+                            temperature = model_config.get("temperature")
                             is_embedding = 1 if model_config.get("is_embedding") else 0
 
                         extra_body_json = json.dumps(extra_body) if extra_body else None
@@ -218,6 +250,8 @@ class AIManagerBase:
                                 model_to_update.model_name = model_name
                             if model_to_update.extra_body != extra_body_json:
                                 model_to_update.extra_body = extra_body_json
+                            if model_to_update.temperature != temperature:
+                                model_to_update.temperature = temperature
                             if model_to_update.is_embedding != is_embedding:
                                 model_to_update.is_embedding = is_embedding
                             del existing_models[display_name]
@@ -227,6 +261,7 @@ class AIManagerBase:
                                 model_name=model_name,
                                 display_name=display_name,
                                 extra_body=extra_body_json,
+                                temperature=temperature,
                                 is_embedding=is_embedding,
                             )
                             session.add(new_model)
@@ -244,10 +279,12 @@ class AIManagerBase:
                             if isinstance(model_config, str):
                                 model_name = model_config
                                 extra_body = None
+                                temperature = None
                                 is_embedding = 0
                             else:
                                 model_name = model_config.get("model_name")
                                 extra_body = model_config.get("extra_body")
+                                temperature = model_config.get("temperature")
                                 is_embedding = 1 if model_config.get("is_embedding") else 0
                             
                             extra_body_json = json.dumps(extra_body) if extra_body else None
@@ -256,14 +293,26 @@ class AIManagerBase:
                                 model_name=model_name,
                                 display_name=display_name,
                                 extra_body=extra_body_json,
+                                temperature=temperature,
                                 is_embedding=is_embedding,
                             )
                             session.add(new_model)
                             print(f"[增量同步] 平台 {name} 添加新模型: {display_name}")
 
             session.commit()
-            with self._cache_lock:
-                self._sys_platforms_cache = None
+            self._invalidate_sys_platforms_cache()
+
+    def _invalidate_sys_platforms_cache(self):
+        with self._cache_lock:
+            self._sys_platforms_cache = None
+            self._sys_platforms_cache_at = 0.0
+
+    def _is_sys_platforms_cache_expired(self) -> bool:
+        if self._sys_platforms_cache is None:
+            return True
+        if self._sys_platforms_cache_ttl <= 0:
+            return False
+        return (time.time() - self._sys_platforms_cache_at) > self._sys_platforms_cache_ttl
 
     def admin_reload_from_yaml(self) -> bool:
         """
@@ -279,16 +328,81 @@ class AIManagerBase:
         self._sync_default_platforms(force_reset=True)
         return True
 
+    def admin_export_to_yaml(self) -> str:
+        """
+        管理员：将数据库中的系统平台配置导出并覆盖 llm_mgr_cfg.yaml
+        """
+        import yaml
+        import os
+        from .models import LLMPlatform
+
+        config_path = os.path.join(os.path.dirname(__file__), "llm_mgr_cfg.yaml")
+        export_data = {}
+
+        with self.Session() as session:
+            platforms = (
+                session.query(LLMPlatform)
+                .options(selectinload(LLMPlatform.models))
+                .filter_by(is_sys=1)
+                .all()
+            )
+
+            for plat in platforms:
+                if bool(plat.disable):
+                    continue
+
+                plat_config = {
+                    "base_url": plat.base_url,
+                    "models": {}
+                }
+                
+                # 导出 API Key (如果存在且已加密，保持加密字符串)
+                if plat.api_key:
+                    plat_config["api_key"] = plat.api_key
+
+                for model in plat.models:
+                    if self._is_model_disabled(model):
+                        continue
+                    
+                    if not model.extra_body and not model.is_embedding:
+                        # 尝试使用简单形式： DisplayName: ModelID
+                        plat_config["models"][model.display_name] = model.model_name
+                    else:
+                        entry = {"model_name": model.model_name}
+                        if model.extra_body:
+                            try:
+                                entry["extra_body"] = json.loads(model.extra_body)
+                            except:
+                                pass
+                        if model.temperature is not None:
+                            entry["temperature"] = model.temperature
+                        if model.is_embedding:
+                            entry["is_embedding"] = True
+                        
+                        plat_config["models"][model.display_name] = entry
+
+                export_data[plat.name] = plat_config
+
+        # 写入文件
+        # allow_unicode=True 确保中文正常显示
+        with open(config_path, "w", encoding="utf-8") as f:
+            yaml.dump(export_data, f, allow_unicode=True, sort_keys=False, default_flow_style=False)
+            
+        return config_path
+
     def _get_sys_config(self, session):
-        if self._sys_platforms_cache is None:
+        if self._is_sys_platforms_cache_expired():
             with self._cache_lock:
-                if self._sys_platforms_cache is None:
+                if self._is_sys_platforms_cache_expired():
                     self._sys_platforms_cache = (
                         session.query(LLMPlatform)
                         .options(selectinload(LLMPlatform.models))
                         .filter_by(is_sys=1)
+                        .filter(LLMPlatform.disable == 0)
+                        .order_by(LLMPlatform.sort_order)
                         .all()
                     )
+                    self._sys_platforms_cache_at = time.time()
 
     def _ensure_mutable(self):
         if self.use_sys_llm_config:
@@ -304,6 +418,9 @@ class AIManagerBase:
 
     @staticmethod
     def _apply_model_params(model_obj: 'LLModels', kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        if model_obj is not None and getattr(model_obj, "temperature", None) is not None and "temperature" not in kwargs:
+            kwargs["temperature"] = float(model_obj.temperature)
+
         if model_obj and model_obj.extra_body:
             try:
                 model_extra_params = json.loads(model_obj.extra_body)
@@ -311,7 +428,11 @@ class AIManagerBase:
                     model_kwargs = kwargs.get("model_kwargs", {})
                     existing_extra_body = kwargs.get("extra_body", model_kwargs.get("extra_body", {}))
                     merged_extra_body = {**existing_extra_body, **model_extra_params}
-                    kwargs["extra_body"] = merged_extra_body
+                    # ⚠️ 如果 extra_body 配置中错误包含了 streaming 字段，此处将其删除。
+                    # 流式/非流式由调用方式（invoke/stream）自动决定，不应通过 extra_body 控制。
+                    merged_extra_body.pop("streaming", None)
+                    if merged_extra_body:
+                        kwargs["extra_body"] = merged_extra_body
             except json.JSONDecodeError:
                 pass
         return kwargs
@@ -390,7 +511,7 @@ class AIManagerBase:
             if cred and cred.api_key:
                 api_key = sec_mgr.decrypt(cred.api_key)
             
-            if not api_key and (user_id == SYSTEM_USER_ID or LLM_AUTO_KEY):
+            if not api_key and (user_id == SYSTEM_USER_ID or self.llm_auto_key):
                 api_key = self._get_default_platform_api_key(platform_name=platform.name, base_url=platform.base_url)
         else:
             api_key = sec_mgr.decrypt(platform.api_key)
@@ -398,6 +519,22 @@ class AIManagerBase:
                 api_key = self._get_default_platform_api_key(platform_name=platform.name, base_url=platform.base_url)
         
         return api_key
+
+    def _is_platform_disabled(self, session, user_id: str, platform: LLMPlatform) -> bool:
+        if platform.is_sys:
+            cred = session.query(LLMSysPlatformKey).filter_by(
+                user_id=user_id, platform_id=platform.id
+            ).first()
+            return bool(platform.disable) or bool(cred and cred.disable)
+        return bool(platform.disable)
+
+    def _is_model_disabled(self, model: Optional[LLModels]) -> bool:
+        if not model:
+            return True
+        return bool(getattr(model, "disable", 0))
+
+    def _set_model_disabled(self, model: LLModels, disabled: bool) -> None:
+        model.disable = 1 if disabled else 0
 
     def ensure_user_has_config(self, session, user_id: str) -> UserModelUsage:
         """确保用户至少拥有内置用途槽位，并返回默认用途(main)槽位。"""
@@ -423,6 +560,9 @@ class AIManagerBase:
             plat = session.query(LLMPlatform).filter_by(id=platform_id).first()
             if not plat:
                 raise ValueError("平台不存在")
+
+            if self._is_platform_disabled(session, user_id, plat):
+                raise ValueError("平台已禁用")
             
             # 权限检查：系统平台或者用户自己的平台
             if not plat.is_sys and plat.user_id != user_id:
@@ -449,6 +589,9 @@ class AIManagerBase:
             plat = session.query(LLMPlatform).filter_by(id=platform_id).first()
             if not plat:
                 raise ValueError("平台不存在")
+
+            if self._is_platform_disabled(session, user_id, plat):
+                raise ValueError("平台已禁用")
             
             if not plat.is_sys and plat.user_id != user_id:
                 raise ValueError("无权访问此平台")
@@ -482,6 +625,9 @@ class AIManagerBase:
             plat = session.query(LLMPlatform).filter_by(id=platform_id).first()
             if not plat:
                 raise ValueError("平台不存在")
+
+            if self._is_platform_disabled(session, user_id, plat):
+                raise ValueError("平台已禁用")
             
             if not plat.is_sys and plat.user_id != user_id:
                 raise ValueError("无权访问此平台")
@@ -510,6 +656,9 @@ class AIManagerBase:
             if not plat:
                 raise ValueError("平台不存在")
 
+            if self._is_platform_disabled(session, user_id, plat):
+                raise ValueError("平台已禁用")
+
             if not plat.is_sys and plat.user_id != user_id:
                 raise ValueError("无权访问此平台")
 
@@ -527,16 +676,21 @@ class AIManagerBase:
     def get_system_config(self) -> Dict[str, bool]:
         """获取系统级配置 (LLM_AUTO_KEY, USE_SYS_LLM_CONFIG)"""
         return {
-            "llm_auto_key": LLM_AUTO_KEY,
+            "llm_auto_key": self.llm_auto_key,
             "use_sys_llm_config": self.use_sys_llm_config
         }
 
-    def set_system_config(self, use_sys_llm_config: bool = None) -> bool:
+    def set_system_config(self, use_sys_llm_config: bool = None, llm_auto_key: bool = None) -> bool:
         """设置系统级配置"""
         changed = False
         if use_sys_llm_config is not None:
             if self.use_sys_llm_config != use_sys_llm_config:
                 self.use_sys_llm_config = use_sys_llm_config
+                changed = True
+        
+        if llm_auto_key is not None:
+            if self.llm_auto_key != llm_auto_key:
+                self.llm_auto_key = llm_auto_key
                 changed = True
         
         if changed:
@@ -562,4 +716,7 @@ class AIManager(
     
     def __init__(self, db_name: str = "llm_config.db"):
         super().__init__(db_name)
-        self.initialize_defaults()
+        # ⚠️ 不要在这里调用 initialize_defaults()
+        # 这会导致 Import 时建立 DB 连接，从而在启动迁移时造成 SQLite 死锁。
+        # 请务必在 app.py 的 lifespan 中显式调用 LLM_Manager.initialize_defaults()
+        # self.initialize_defaults()

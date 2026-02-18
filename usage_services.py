@@ -2,11 +2,12 @@
 使用统计 Mixin
 基于 UsageLogEntry 时序日志表进行查询
 
-注意：原有的 record_usage 方法已废弃。
-用量记录现在由 TrackedChatModel 自动完成。
+用量记录由 UsageTrackingCallback 自动完成（注入到 ChatOpenAI 的 callbacks 参数中）。
+本 Mixin 提供面向用户/管理员的聚合查询接口，精确到 user_id + model_id 维度，
+支持限额、限次、计费等扩展场景。
 """
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, UTC
 from typing import Optional, List, Dict, Any
 
 from sqlalchemy import func
@@ -53,7 +54,7 @@ class UsageServicesMixin:
             
             # 应用时间过滤
             if since is not None:
-                cutoff = datetime.utcnow() - since
+                cutoff = datetime.now(UTC) - since
                 query = query.filter(UsageLogEntry.created_at >= cutoff)
             elif start_time is not None or end_time is not None:
                 if start_time is not None:
@@ -85,10 +86,10 @@ class UsageServicesMixin:
                 
                 result.append({
                     "model_id": row.model_id,
-                    "model_name": model.model_name if model else "Unknown",
-                    "display_name": model.display_name if model else "Unknown",
+                    "model_name": model.model_name if model else "已删除模型",
+                    "display_name": model.display_name if model else "已删除模型",
                     "platform_id": platform.id if platform else None,
-                    "platform_name": platform.name if platform else "Unknown",
+                    "platform_name": platform.name if platform else "已删除平台",
                     "prompt_tokens": int(row.prompt_tokens),
                     "completion_tokens": int(row.completion_tokens),
                     "total_tokens": int(row.total_tokens),
@@ -129,7 +130,7 @@ class UsageServicesMixin:
             )
             
             if since is not None:
-                cutoff = datetime.utcnow() - since
+                cutoff = datetime.now(UTC) - since
                 query = query.filter(UsageLogEntry.created_at >= cutoff)
             
             result = query.first()
@@ -165,7 +166,7 @@ class UsageServicesMixin:
             )
             
             if since is not None:
-                cutoff = datetime.utcnow() - since
+                cutoff = datetime.now(UTC) - since
                 query = query.filter(UsageLogEntry.created_at >= cutoff)
             
             query = query.group_by(UsageLogEntry.agent_name)
@@ -216,7 +217,7 @@ class UsageServicesMixin:
             )
             
             if since is not None:
-                cutoff = datetime.utcnow() - since
+                cutoff = datetime.now(UTC) - since
                 query = query.filter(UsageLogEntry.created_at >= cutoff)
             
             query = query.group_by(time_group).order_by(time_group)
@@ -242,7 +243,7 @@ class UsageServicesMixin:
         Returns:
             删除的记录数
         """
-        cutoff = datetime.utcnow() - older_than
+        cutoff = datetime.now(UTC) - older_than
         
         with self.Session() as session:
             deleted = session.query(UsageLogEntry).filter(

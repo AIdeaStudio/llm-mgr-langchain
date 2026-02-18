@@ -33,6 +33,24 @@ class UserServicesMixin:
             "model_id": model_obj.id,
             "model_name": model_obj.model_name,
             "api_key_set": bool(api_key),
+            "needs_rebind": False,
+        }
+
+    def _build_invalid_usage_payload(self, slot: UserModelUsage, error_message: str) -> Dict[str, Any]:
+        return {
+            "usage_key": slot.usage_key,
+            "usage_label": slot.usage_label,
+            "platform": "⚠ 平台已失效，请重新选择",
+            "platform_id": slot.selected_platform_id if slot.selected_platform_id is not None else -1,
+            "platform_is_sys": False,
+            "base_url": "",
+            "model_display_name": "⚠ 模型已失效，请重新选择",
+            "model_id": slot.selected_model_id if slot.selected_model_id is not None else -1,
+            "model_name": "",
+            "api_key_set": False,
+            "missing_key": True,
+            "needs_rebind": True,
+            "error": error_message,
         }
 
     def _collect_usage_payloads(self, session, user_id: str) -> List[Dict[str, Any]]:
@@ -48,7 +66,10 @@ class UserServicesMixin:
             .all()
         )
         details: List[Dict[str, Any]] = []
+        has_auto_fixed = False
         for slot in slots:
+            old_platform_id = slot.selected_platform_id
+            old_model_id = slot.selected_model_id
             try:
                 # 优化：传入已加载的对象
                 resolved = self._resolve_user_choice(
@@ -57,25 +78,22 @@ class UserServicesMixin:
                     slot.selected_platform_id,
                     slot.selected_model_id,
                     usage_slot=slot,
+                    auto_fix=True,
                     raise_on_missing_key=False,
                     platform_obj=slot.platform,
                     model_obj=slot.model
                 )
+                if slot.selected_platform_id != old_platform_id or slot.selected_model_id != old_model_id:
+                    has_auto_fixed = True
                 payload = self._build_usage_payload(resolved, slot)
                 if not resolved.get("api_key"):
                     payload["missing_key"] = True
                     payload["error"] = "API Key 未配置"
                 details.append(payload)
             except ValueError as e:
-                details.append({
-                    "usage_key": slot.usage_key,
-                    "usage_label": slot.usage_label,
-                    "error": str(e),
-                    "missing_key": True,
-                    "platform": "Unknown",
-                    "model_display_name": "Unknown",
-                    "api_key_set": False,
-                })
+                details.append(self._build_invalid_usage_payload(slot, str(e)))
+        if has_auto_fixed:
+            session.commit()
         return details
 
     def save_user_selection(
@@ -91,6 +109,11 @@ class UserServicesMixin:
 
         with self.Session() as session:
             self.ensure_user_has_config(session, user_id)
+            plat = session.query(LLMPlatform).filter_by(id=platform_id).first()
+            if not plat:
+                raise ValueError("平台不存在")
+            if self._is_platform_disabled(session, user_id, plat):
+                raise ValueError("平台已禁用")
             slot = self._get_usage_slot(session, user_id, normalized_usage)
             if not slot:
                 raise ValueError(f"用途 '{normalized_usage}' 不存在")
@@ -217,28 +240,25 @@ class UserServicesMixin:
                 raise ValueError(f"未找到用途 '{normalized_usage}' 的模型配置")
 
             try:
+                old_platform_id = usage_slot.selected_platform_id
+                old_model_id = usage_slot.selected_model_id
                 resolved = self._resolve_user_choice(
                     session,
                     user_id,
                     usage_slot.selected_platform_id,
                     usage_slot.selected_model_id,
                     usage_slot=usage_slot,
+                    auto_fix=True,
                     raise_on_missing_key=False,
                 )
+                if usage_slot.selected_platform_id != old_platform_id or usage_slot.selected_model_id != old_model_id:
+                    session.commit()
                 current_detail = self._build_usage_payload(resolved, usage_slot)
                 if not resolved.get("api_key"):
                     current_detail["missing_key"] = True
                     current_detail["error"] = "API Key 未配置"
             except ValueError as e:
-                current_detail = {
-                    "usage_key": usage_slot.usage_key,
-                    "usage_label": usage_slot.usage_label,
-                    "error": str(e),
-                    "missing_key": True,
-                    "platform": "Unknown",
-                    "model_display_name": "Unknown",
-                    "api_key_set": False,
-                }
+                current_detail = self._build_invalid_usage_payload(usage_slot, str(e))
             
             all_details = self._collect_usage_payloads(session, user_id)
             
@@ -268,6 +288,8 @@ class UserServicesMixin:
             model = session.query(LLModels).filter_by(id=model_id).first()
             if not plat or not model:
                 raise ValueError("平台或模型不存在")
+            if self._is_platform_disabled(session, user_id, plat):
+                raise ValueError("平台已禁用")
             if model.platform_id != plat.id:
                 raise ValueError("模型不属于该平台")
             if not model.is_embedding:
@@ -296,7 +318,7 @@ class UserServicesMixin:
             if selection and selection.platform_id and selection.model_id:
                 plat = session.query(LLMPlatform).filter_by(id=selection.platform_id).first()
                 model = session.query(LLModels).filter_by(id=selection.model_id).first()
-                if plat and model and model.is_embedding:
+                if plat and model and model.is_embedding and not self._is_platform_disabled(session, user_id, plat):
                     current = self._build_embedding_payload(session, user_id, plat, model)
 
             return {
